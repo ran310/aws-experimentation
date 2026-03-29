@@ -16,6 +16,12 @@
   "context": {
     "@aws-cdk/core:newStyleStackSynthesis": true,
     "@aws-cdk/aws-apigateway:disableCloudWatchRole": false,
-    "projectName": "learn-aws"
+    "projectName": "learn-aws",
+    "publicAlbHttps": {
+      "hostedZoneId": "Z00475116AGAJ2WM26GG",
+      "zoneName": "ram-narayanan.com",
+      "certificateDomainName": "ram-narayanan.com",
+      "subjectAlternativeNames": ["www.ram-narayanan.com"]
+    }
   }
 }

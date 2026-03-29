@@ -1,0 +1,11 @@
+{
+  "publicAlbHttps": {
+    "hostedZoneId": "Z1234567890ABC",
+    "zoneName": "ram-narayanan.com",
+    "certificateDomainName": "ram-narayanan.com",
+    "subjectAlternativeNames": [
+      "www.ram-narayanan.com",
+      "nfl-quiz.ram-narayanan.com"
+    ]
+  }
+}

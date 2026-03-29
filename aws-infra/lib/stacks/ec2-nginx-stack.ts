@@ -1,10 +1,19 @@
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as elbv2_targets from 'aws-cdk-lib/aws-elasticloadbalancingv2-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as route53_targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Buffer } from 'node:buffer';
 import { Construct } from 'constructs';
-import { stackDescription } from '../config';
+import {
+  fqdnToRelativeRecordName,
+  PublicAlbHttpsContext,
+  stackDescription,
+} from '../config';
 
 /** Path prefix where nfl-quiz is served (must match Flask APPLICATION_ROOT / nginx). */
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
@@ -12,11 +21,29 @@ export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
 export interface Ec2NginxStackProps extends cdk.StackProps {
   readonly projectName: string;
   readonly vpc: ec2.IVpc;
+  /**
+   * ACM + internet ALB + Route 53 aliases. TLS terminates at ALB; nginx stays on :80.
+   * Omit for Elastic IP + direct HTTP/HTTPS to the instance (manual Certbot on :443).
+   */
+  readonly publicAlbHttps?: PublicAlbHttpsContext;
+}
+
+function relativeAliasNames(cfg: PublicAlbHttpsContext): string[] {
+  if (cfg.aliasNames !== undefined && cfg.aliasNames.length > 0) {
+    return [...new Set(cfg.aliasNames)];
+  }
+  const primary = cfg.certificateDomainName;
+  const sans = cfg.subjectAlternativeNames ?? [];
+  const rel = [primary, ...sans].map((d) => fqdnToRelativeRecordName(d, cfg.zoneName));
+  return [...new Set(rel)];
 }
 
 /**
  * Single t4g.nano in a public subnet: nginx routes multiple path prefixes; nfl-quiz is proxied
- * to Gunicorn on :8080 under {@link NFL_QUIZ_PATH_PREFIX}. Elastic IP keeps a stable address.
+ * to Gunicorn on :8080 under {@link NFL_QUIZ_PATH_PREFIX}.
+ *
+ * Either **Elastic IP** + open 80/443 to the world, or **publicAlbHttps** (ACM + ALB + Route 53)
+ * for fully automated TLS with no instance login.
  */
 export class Ec2NginxStack extends cdk.Stack {
   public readonly instance: ec2.Instance;
@@ -29,7 +56,7 @@ export class Ec2NginxStack extends cdk.Stack {
       description: stackDescription('EC2 t4g.nano + nginx multi-app paths'),
     });
 
-    const { vpc, projectName } = props;
+    const { vpc, projectName, publicAlbHttps: httpsCfg } = props;
     const quizPath = NFL_QUIZ_PATH_PREFIX;
 
     this.artifactBucket = new s3.Bucket(this, 'NflQuizArtifacts', {
@@ -41,12 +68,28 @@ export class Ec2NginxStack extends cdk.Stack {
       autoDeleteObjects: true,
     });
 
+    let albSg: ec2.SecurityGroup | undefined;
+    if (httpsCfg) {
+      albSg = new ec2.SecurityGroup(this, 'AlbSg', {
+        vpc,
+        description: 'Internet ALB (ACM TLS)',
+        allowAllOutbound: true,
+      });
+      albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS from internet');
+      albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'HTTP redirect to HTTPS');
+    }
+
     this.instanceSecurityGroup = new ec2.SecurityGroup(this, 'InstanceSg', {
       vpc,
       description: 'nginx host',
       allowAllOutbound: true,
     });
-    this.instanceSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'HTTP');
+    if (httpsCfg && albSg) {
+      this.instanceSecurityGroup.addIngressRule(albSg, ec2.Port.tcp(80), 'HTTP from ALB only');
+    } else {
+      this.instanceSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'HTTP');
+      this.instanceSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS');
+    }
 
     const role = new iam.Role(this, 'InstanceRole', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
@@ -147,36 +190,109 @@ export class Ec2NginxStack extends cdk.Stack {
 
     cdk.Tags.of(this.instance).add('Name', `${projectName}-nginx`);
 
-    const eip = new ec2.CfnEIP(this, 'NginxEip', {
-      domain: 'vpc',
-      tags: [{ key: 'Name', value: `${projectName}-nginx-eip` }],
-    });
+    if (httpsCfg && albSg) {
+      const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'PublicZone', {
+        hostedZoneId: httpsCfg.hostedZoneId,
+        zoneName: httpsCfg.zoneName,
+      });
 
-    new ec2.CfnEIPAssociation(this, 'NginxEipAssoc', {
-      allocationId: eip.attrAllocationId,
-      instanceId: this.instance.instanceId,
-    });
+      const sans = httpsCfg.subjectAlternativeNames ?? [];
+      const certificate = new acm.Certificate(this, 'SiteCertificate', {
+        domainName: httpsCfg.certificateDomainName,
+        subjectAlternativeNames: sans.length > 0 ? sans : undefined,
+        validation: acm.CertificateValidation.fromDns(hostedZone),
+      });
 
-    new cdk.CfnOutput(this, 'NginxElasticIp', {
-      value: eip.attrPublicIp,
-      description: 'Stable public IPv4 (Elastic IP) for http://IP/',
-    });
+      const albName = `${projectName}-alb`.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 32);
+      const alb = new elbv2.ApplicationLoadBalancer(this, 'PublicAlb', {
+        vpc,
+        internetFacing: true,
+        loadBalancerName: albName,
+        securityGroup: albSg,
+      });
 
-    new cdk.CfnOutput(this, 'NginxPublicIp', {
-      value: eip.attrPublicIp,
-      description: 'Same as NginxElasticIp — http://IP/ and paths /app1/, /app2/, /nfl-quiz/',
-    });
+      const targetGroup = new elbv2.ApplicationTargetGroup(this, 'NginxTargetGroup', {
+        vpc,
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        targets: [new elbv2_targets.InstanceTarget(this.instance, 80)],
+        healthCheck: {
+          path: '/',
+          healthyHttpCodes: '200-399',
+        },
+      });
+
+      alb.addListener('Https', {
+        port: 443,
+        protocol: elbv2.ApplicationProtocol.HTTPS,
+        certificates: [certificate],
+        defaultAction: elbv2.ListenerAction.forward([targetGroup]),
+      });
+
+      alb.addListener('HttpRedirect', {
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        defaultAction: elbv2.ListenerAction.redirect({
+          protocol: 'HTTPS',
+          port: '443',
+          permanent: true,
+        }),
+      });
+
+      const labels = relativeAliasNames(httpsCfg);
+      labels.forEach((label, i) => {
+        new route53.ARecord(this, `AlbAlias${i}`, {
+          zone: hostedZone,
+          recordName: label.length > 0 ? label : undefined,
+          target: route53.RecordTarget.fromAlias(new route53_targets.LoadBalancerTarget(alb)),
+        });
+      });
+
+      const albDnsName = alb.loadBalancerDnsName;
+      new cdk.CfnOutput(this, 'LoadBalancerDns', {
+        value: albDnsName,
+        description: 'ALB DNS (alias records point here)',
+      });
+      new cdk.CfnOutput(this, 'NginxHttpsBaseUrl', {
+        value: `https://${httpsCfg.certificateDomainName}/`,
+        description: 'HTTPS base URL (primary cert name)',
+      });
+      new cdk.CfnOutput(this, 'NflQuizHttpsUrl', {
+        value: cdk.Fn.join('', ['https://', httpsCfg.certificateDomainName, `${quizPath}/`]),
+        description: 'HTTPS nfl-quiz URL (primary name + path)',
+      });
+    } else {
+      const eip = new ec2.CfnEIP(this, 'NginxEip', {
+        domain: 'vpc',
+        tags: [{ key: 'Name', value: `${projectName}-nginx-eip` }],
+      });
+
+      new ec2.CfnEIPAssociation(this, 'NginxEipAssoc', {
+        allocationId: eip.attrAllocationId,
+        instanceId: this.instance.instanceId,
+      });
+
+      new cdk.CfnOutput(this, 'NginxElasticIp', {
+        value: eip.attrPublicIp,
+        description: 'Stable public IPv4 (Elastic IP) for http://IP/',
+      });
+
+      new cdk.CfnOutput(this, 'NginxPublicIp', {
+        value: eip.attrPublicIp,
+        description: 'Same as NginxElasticIp — http://IP/ and paths /app1/, /app2/, /nfl-quiz/',
+      });
+
+      new cdk.CfnOutput(this, 'NflQuizUrl', {
+        value: cdk.Fn.join('', ['http://', eip.attrPublicIp, `${quizPath}/`]),
+        description: 'Base URL for the nfl-quiz app',
+      });
+    }
 
     new cdk.CfnOutput(this, 'NginxInstanceId', { value: this.instance.instanceId });
 
     new cdk.CfnOutput(this, 'NflQuizArtifactBucketName', {
       value: this.artifactBucket.bucketName,
       description: 'S3 bucket for nfl-quiz release tarballs (prefix nfl-quiz/)',
-    });
-
-    new cdk.CfnOutput(this, 'NflQuizUrl', {
-      value: cdk.Fn.join('', ['http://', eip.attrPublicIp, `${quizPath}/`]),
-      description: 'Base URL for the nfl-quiz app',
     });
   }
 }
