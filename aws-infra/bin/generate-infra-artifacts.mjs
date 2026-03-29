@@ -98,6 +98,7 @@ function buildMermaid(stacks) {
     ec2: hasId(stacks, 'AwsInfra-Ec2Nginx'),
     redis: hasId(stacks, 'AwsInfra-ElastiCacheRedis'),
     api: hasId(stacks, 'AwsInfra-HttpApi'),
+    lake: hasId(stacks, 'AwsInfra-Lakehouse-S3'),
   };
   const ec2Alb = H.ec2 && ec2StackHasApplicationLoadBalancer(stacks);
 
@@ -154,6 +155,14 @@ function buildMermaid(stacks) {
     parts.push('  end');
   }
 
+  if (H.lake) {
+    parts.push('  subgraph LAKE["AwsInfra-Lakehouse-S3"]');
+    parts.push(
+      '    LAKEBKT["S3 data lake<br/>prefixes + IAM managed policies"]',
+    );
+    parts.push('  end');
+  }
+
   if (H.api) parts.push('  U --> APIGW');
   if (H.ec2) {
     parts.push(ec2Alb ? '  U --> ALB' : '  U --> EC2');
@@ -161,13 +170,20 @@ function buildMermaid(stacks) {
   if (H.ec2 && H.net) parts.push('  EC2 --> V');
   if (H.redis && H.net) parts.push('  REDIS --> PRIV');
   if (H.ec2 && H.redis) parts.push('  EC2 --> REDIS');
+  if (H.api && H.lake) {
+    parts.push('  LAM -.->|attach read/write policy| LAKEBKT');
+  }
+  if (H.ec2 && H.lake) {
+    parts.push('  EC2 -.->|attach policy| LAKEBKT');
+  }
 
   parts.push(
     '  classDef aws fill:#232f3e,color:#fff,stroke:#ff9900,stroke-width:2px',
   );
   const awsNodes =
     'APIGW,LAM,V,PUB,PRIV,NAT,EC2,REDIS' +
-    (ec2Alb ? ',R53,ACM,ALB' : '');
+    (ec2Alb ? ',R53,ACM,ALB' : '') +
+    (H.lake ? ',LAKEBKT' : '');
   parts.push(`  class ${awsNodes} aws`);
 
   return parts.join('\n') + '\n';

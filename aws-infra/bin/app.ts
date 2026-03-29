@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { projectName, publicAlbHttpsConfig } from '../lib/config';
+import {
+  lakehouseBucketNameFromContext,
+  projectName,
+  publicAlbHttpsConfig,
+} from '../lib/config';
 import { Ec2NginxStack } from '../lib/stacks/ec2-nginx-stack';
 import { ElastiCacheRedisStack } from '../lib/stacks/elasticache-redis-stack';
 import { HttpApiStack } from '../lib/stacks/http-api-stack';
+import { LakehouseStack } from '../lib/stacks/lakehouse-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
 const app = new cdk.App();
@@ -41,4 +46,10 @@ new ElastiCacheRedisStack(app, 'AwsInfra-ElastiCacheRedis', {
 new HttpApiStack(app, 'AwsInfra-HttpApi', {
   env,
   projectName: name,
+});
+
+new LakehouseStack(app, 'AwsInfra-Lakehouse-S3', {
+  env,
+  projectName: name,
+  bucketName: lakehouseBucketNameFromContext(app),
 });

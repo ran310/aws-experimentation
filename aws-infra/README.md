@@ -25,8 +25,23 @@ See [`generated/README.md`](generated/README.md).
 | `AwsInfra-Ec2Nginx` | **t4g.nano** + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). |
 | `AwsInfra-ElastiCacheRedis` | Single-node **Redis** (`cache.t4g.micro`) in private subnets; allows Redis from the **EC2** security group on 6379. |
 | `AwsInfra-HttpApi` | **HTTP API (API Gateway v2)** + **Lambda** (Node 20, no VPC) — **JSON sample API** only. The **dashboard UI** is **not** here; use **`aws-infra-dashboard`**. |
+| `AwsInfra-Lakehouse-S3` | **S3** lake bucket (default name **`mylakehouse-{account}-{region}`**) + **IAM managed policies** for read-only vs read/write. Attach policies to any app role; organize data with **prefixes** (e.g. `raw/`, `curated/`). |
 
 Layout: `lib/stacks/` for stacks, `lib/constructs/` for shared constructs you add later.
+
+### Lakehouse bucket name (optional)
+
+Override the default S3 name with context **`lakehouseBucketName`** (must be **globally unique**):
+
+```json
+"context": {
+  "lakehouseBucketName": "mylakehouse-prod"
+}
+```
+
+If omitted, the bucket is **`mylakehouse-<account-id>-<region>`** so it stays unique while keeping the **`mylakehouse`** prefix.
+
+**Using policies:** After deploy, attach **`LakehouseReadOnlyPolicyArn`** or **`LakehouseReadWritePolicyArn`** (stack outputs) to Lambda roles, EC2 instance roles, ECS task roles, etc. **Prefix-scoped** permissions (different apps → different folders) can be added later with extra managed policies or `s3:prefix` conditions.
 
 ---
 
@@ -40,7 +55,7 @@ Layout: `lib/stacks/` for stacks, `lib/constructs/` for shared constructs you ad
 
 - **Node.js 20+** and npm
 - **AWS CLI v2** configured
-- IAM permissions for VPC, EC2, ElastiCache, Lambda, API Gateway, IAM, CloudFormation, etc.
+- IAM permissions for VPC, EC2, ElastiCache, Lambda, API Gateway, IAM, S3, CloudFormation, etc.
 - If you use **managed HTTPS** (`publicAlbHttps`): **ACM**, **Elastic Load Balancing**, **Route 53** (records in the hosted zone).
 
 ### 1. Install
@@ -88,9 +103,10 @@ npx cdk deploy AwsInfra-Network
 npx cdk deploy AwsInfra-Ec2Nginx
 npx cdk deploy AwsInfra-ElastiCacheRedis
 npx cdk deploy AwsInfra-HttpApi
+npx cdk deploy AwsInfra-Lakehouse-S3
 ```
 
-`AwsInfra-HttpApi` has **no VPC** dependency; you can deploy it alone for a quick serverless-only test. Stacks that use the VPC and **Ec2Nginx** security group need **Network** and **Ec2Nginx** deployed first.
+`AwsInfra-HttpApi` and **`AwsInfra-Lakehouse-S3`** have **no VPC** dependency (deploy them anytime). Stacks that use the VPC and **Ec2Nginx** security group need **Network** and **Ec2Nginx** deployed first.
 
 ### 6. HTTP API sample (Lambda JSON, not the dashboard)
 
@@ -151,7 +167,7 @@ If you **omit** `publicAlbHttps`, the stack keeps an **Elastic IP** and opens **
 npx cdk destroy --all
 ```
 
-Or destroy stacks individually (often **HttpApi** / **Redis** / **EC2** before **Network**).
+Or destroy stacks individually (often **HttpApi** / **Lakehouse-S3** / **Redis** / **EC2** before **Network**). The lake bucket uses **RETAIN** so the bucket (and objects) remain after stack delete unless you empty it first.
 
 ---
 

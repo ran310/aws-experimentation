@@ -2,7 +2,7 @@
 
 **Python (FastAPI)** API plus **React (Vite)** UI that visualize whatever `aws-infra` last synthesized.
 
-- **Stacks table** — reads `aws-infra/generated/stacks-overview.json` (resource counts, types, outputs). Stack IDs match the CDK app (`AwsInfra-Network`, `AwsInfra-Ec2Nginx`, `AwsInfra-ElastiCacheRedis`, `AwsInfra-HttpApi`).
+- **Stacks table** — reads `aws-infra/generated/stacks-overview.json` (resource counts, types, outputs). Stack IDs match the CDK app (`AwsInfra-Network`, `AwsInfra-Ec2Nginx`, `AwsInfra-ElastiCacheRedis`, `AwsInfra-HttpApi`, `AwsInfra-Lakehouse-S3`).
 - **Architecture diagram** — renders `aws-infra/generated/architecture.mmd` (Mermaid).
 - **Auto-refresh infra** — the backend **watches** `aws-infra/lib`, `aws-infra/bin`, and `aws-infra/cdk.json` and runs **`npm run synth`** (debounced ~1.5s after saves). The UI **polls** the API every 2.5s so you see updates without a manual reload.
 

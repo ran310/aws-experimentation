@@ -26,6 +26,15 @@ export interface PublicAlbHttpsContext {
   readonly aliasNames?: string[];
 }
 
+/**
+ * Optional exact S3 bucket name for the lakehouse stack (must be globally unique).
+ * If unset, the bucket is named `mylakehouse-{account}-{region}`.
+ */
+export function lakehouseBucketNameFromContext(app: cdk.App): string | undefined {
+  const v = app.node.tryGetContext('lakehouseBucketName');
+  return typeof v === 'string' && v.trim().length > 0 ? v.trim() : undefined;
+}
+
 export function publicAlbHttpsConfig(app: cdk.App): PublicAlbHttpsContext | undefined {
   let c = app.node.tryGetContext('publicAlbHttps') as PublicAlbHttpsContext | string | undefined;
   if (c == null) {
