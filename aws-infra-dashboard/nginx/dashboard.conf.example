@@ -1,0 +1,34 @@
+# Example: serve aws-infra-dashboard on the EC2 nginx host (port 80).
+#
+# The CDK bootstrap nginx config (`/etc/nginx/conf.d/<projectName>-apps.conf`) also uses
+# `default_server` on :80. Disable or remove that file before using this one, or merge
+# the `location` blocks below into the existing `server { }` instead of copying wholesale.
+#
+# Adjust `root` to your clone. Then:
+#   sudo cp dashboard.conf.example /etc/nginx/conf.d/99-dashboard.conf
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# FastAPI on 127.0.0.1:8000 — see systemd/aws-infra-dashboard.service.example
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Built Vite app (run: cd aws-infra-dashboard/frontend && npm run build)
+    root /opt/aws-experimentation/aws-infra-dashboard/frontend/dist;
+    index index.html;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

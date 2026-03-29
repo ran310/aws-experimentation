@@ -1,0 +1,12 @@
+{
+  "name": "aws-experimentation",
+  "private": true,
+  "scripts": {
+    "postinstall": "npm install --prefix aws-infra",
+    "cdk": "npm --prefix aws-infra run cdk --",
+    "synth": "npm --prefix aws-infra run synth",
+    "diff": "npm --prefix aws-infra run diff",
+    "deploy": "npm --prefix aws-infra run cdk -- deploy",
+    "bootstrap": "npm --prefix aws-infra run cdk -- bootstrap"
+  }
+}

@@ -1,0 +1,1 @@
+{"sessionId":"b37c69","hypothesisId":"H1","runId":"post-fix","location":"network-stack.ts:LambdaDataClientSg","message":"SG GroupDescription ASCII check","data":{"description":"Lambda to RDS / ElastiCache (and related private resources)","nonAscii":false},"timestamp":1774752779642}

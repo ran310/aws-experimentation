@@ -1,0 +1,2 @@
+# CDK output when running the CLI from the repository root (cdk.json at root)
+/cdk.out
