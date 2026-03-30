@@ -17,12 +17,30 @@ For a **local browser dashboard** (Python + React) that lists stacks, resources,
 
 See [`generated/README.md`](generated/README.md).
 
+## Deployed stack outputs (AWS CLI)
+
+After stacks exist in your account, you can snapshot **live** CloudFormation outputs (not template defaults) into **`cdk.out/`**, which is **gitignored** and not committed:
+
+```bash
+cd aws-infra
+npm run outputs:fetch
+```
+
+This runs **`aws cloudformation describe-stacks`** for each stack ID in `bin/app.ts` and writes:
+
+| File | Purpose |
+|------|---------|
+| `cdk.out/stack-outputs-deployed.md` | Markdown tables (OutputKey, Description, OutputValue, ExportName). |
+| `cdk.out/stack-outputs-deployed.json` | Same data as JSON for scripts. |
+
+Use the same **AWS CLI profile/region** as deploy (`AWS_PROFILE`, `AWS_REGION`, or `~/.aws/config`). Missing stacks or permission errors are recorded per stack in the files instead of failing the whole run.
+
 ## Stacks
 
 | Stack ID | Purpose |
 |----------|---------|
 | `AwsInfra-Network` | VPC (2 AZs), public + private subnets, **one NAT**. |
-| `AwsInfra-Ec2Nginx` | **t4g.nano** + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). |
+| `AwsInfra-Ec2Nginx` | **t4g.nano** + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). Root EBS is **30 GiB gp3** (see `ec2-nginx-stack.ts`) so large app installs (e.g. Python wheels) do not run out of disk. |
 | `AwsInfra-ElastiCacheRedis` | Single-node **Redis** (`cache.t4g.micro`) in private subnets; allows Redis from the **EC2** security group on 6379. |
 | `AwsInfra-HttpApi` | **HTTP API (API Gateway v2)** + **Lambda** (Node 20, no VPC) — **JSON sample API** only. The **dashboard UI** is **not** here; use **`aws-infra-dashboard`**. |
 | `AwsInfra-Lakehouse-S3` | **S3** lake bucket (default name **`mylakehouse-{account}-{region}`**) + **IAM managed policies** for read-only vs read/write. Attach policies to any app role; organize data with **prefixes** (e.g. `raw/`, `curated/`). |
@@ -107,6 +125,25 @@ npx cdk deploy AwsInfra-Lakehouse-S3
 ```
 
 `AwsInfra-HttpApi` and **`AwsInfra-Lakehouse-S3`** have **no VPC** dependency (deploy them anytime). Stacks that use the VPC and **Ec2Nginx** security group need **Network** and **Ec2Nginx** deployed first.
+
+### Enlarge root disk without replacing the instance (console)
+
+If the stack was created before the **30 GiB** root volume default, or you need more space **without** `cdk deploy` replacing the EC2 instance:
+
+1. **EC2 → Volumes** → select the volume attached to the nginx instance (**/dev/xvda**).
+2. **Actions → Modify volume** → set size (e.g. **30** or **40** GiB) → **Modify**.
+3. **SSM Session Manager** (or SSM Run command) on the instance:
+
+   ```bash
+   sudo growpart /dev/nvme0n1 1   # if root is NVMe; use lsblk to confirm device
+   sudo xfs_growfs -d /           # Amazon Linux 2023 root is usually XFS
+   ```
+
+   On some instances the block device is **`/dev/xvda`** and the partition may be **`/dev/xvda1`** — use **`lsblk`** and **`df -h`** to confirm, then **`growpart`** the correct disk and partition number, then **`xfs_growfs /`**.
+
+4. Verify with **`df -h /`**.
+
+Changing **`blockDevices`** in CDK and redeploying may trigger **instance replacement**; use the console path above to grow disk **in place** on an existing host.
 
 ### 6. HTTP API sample (Lambda JSON, not the dashboard)
 

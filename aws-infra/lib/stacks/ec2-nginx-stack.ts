@@ -18,6 +18,11 @@ import {
 /** Path prefix where nfl-quiz is served (must match Flask APPLICATION_ROOT / nginx). */
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
 
+/**
+ * Gunicorn port for project-showcase (served at `/` — must match deploy/remote-install.sh).
+ */
+export const PROJECT_SHOWCASE_UPSTREAM_PORT = 8081;
+
 export interface Ec2NginxStackProps extends cdk.StackProps {
   readonly projectName: string;
   readonly vpc: ec2.IVpc;
@@ -39,8 +44,10 @@ function relativeAliasNames(cfg: PublicAlbHttpsContext): string[] {
 }
 
 /**
- * Single t4g.nano in a public subnet: nginx routes multiple path prefixes; nfl-quiz is proxied
- * to Gunicorn on :8080 under {@link NFL_QUIZ_PATH_PREFIX}.
+ * Single t4g.nano in a public subnet: **project-showcase** is proxied to Gunicorn on
+ * {@link PROJECT_SHOWCASE_UPSTREAM_PORT} at **`/`**; **nfl-quiz** on :8080 under
+ * {@link NFL_QUIZ_PATH_PREFIX}. ALB health checks **`/nginx-health`** so the target stays healthy
+ * before the showcase app is installed.
  *
  * Either **Elastic IP** + open 80/443 to the world, or **publicAlbHttps** (ACM + ALB + Route 53)
  * for fully automated TLS with no instance login.
@@ -58,6 +65,7 @@ export class Ec2NginxStack extends cdk.Stack {
 
     const { vpc, projectName, publicAlbHttps: httpsCfg } = props;
     const quizPath = NFL_QUIZ_PATH_PREFIX;
+    const showcasePort = PROJECT_SHOWCASE_UPSTREAM_PORT;
 
     this.artifactBucket = new s3.Bucket(this, 'NflQuizArtifacts', {
       bucketName: `${projectName}-nfl-quiz-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
@@ -99,6 +107,8 @@ export class Ec2NginxStack extends cdk.Stack {
     });
 
     this.artifactBucket.grantRead(role, 'nfl-quiz/*');
+    /** Tarballs for project-showcase (GitHub → S3 → SSM pull on instance). */
+    this.artifactBucket.grantRead(role, 'project-showcase/*');
 
     const userData = ec2.UserData.forLinux();
     const nginxConfPath = `/etc/nginx/conf.d/${projectName}-apps.conf`;
@@ -107,6 +117,12 @@ export class Ec2NginxStack extends cdk.Stack {
       '    listen 80 default_server;',
       '    listen [::]:80 default_server;',
       '    server_name _;',
+      '',
+      '    location = /nginx-health {',
+      '        access_log off;',
+      '        default_type text/plain;',
+      "        return 200 'ok';",
+      '    }',
       '',
       `    location = ${quizPath} {`,
       `        return 301 ${quizPath}/;`,
@@ -130,9 +146,22 @@ export class Ec2NginxStack extends cdk.Stack {
       '        alias /var/www/app2/;',
       '        index index.html;',
       '    }',
-      '    location = / {',
-      '        default_type text/html;',
-      `        return 200 '<html><body><h1>${projectName} nginx</h1><p><a href="${quizPath}/">${quizPath}/</a> (nfl-quiz) · <a href="/app1/">/app1/</a> · <a href="/app2/">/app2/</a></p></body></html>';`,
+      '',
+      '    location = /project-showcase {',
+      '        return 301 /;',
+      '    }',
+      '    location /project-showcase/ {',
+      '        rewrite ^/project-showcase/(.*)$ /$1 permanent;',
+      '    }',
+      '',
+      `    location / {`,
+      `        proxy_pass http://127.0.0.1:${showcasePort}/;`,
+      '        proxy_http_version 1.1;',
+      '        proxy_set_header Host $host;',
+      '        proxy_set_header X-Real-IP $remote_addr;',
+      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+      '        proxy_set_header X-Forwarded-Proto $scheme;',
+      '        proxy_set_header X-Forwarded-Prefix "";',
       '    }',
       '}',
     ].join('\n');
@@ -175,6 +204,9 @@ export class Ec2NginxStack extends cdk.Stack {
       'systemctl restart nginx',
     );
 
+    // Default AL2023 root is often 8 GiB — too small for large pip installs (e.g. Deephaven). GP3 is cost-effective.
+    const rootVolumeGiB = 30;
+
     this.instance = new ec2.Instance(this, 'NginxHost', {
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
@@ -186,6 +218,15 @@ export class Ec2NginxStack extends cdk.Stack {
       role,
       userData,
       associatePublicIpAddress: true,
+      blockDevices: [
+        {
+          deviceName: '/dev/xvda',
+          volume: ec2.BlockDeviceVolume.ebs(rootVolumeGiB, {
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
+            deleteOnTermination: true,
+          }),
+        },
+      ],
     });
 
     cdk.Tags.of(this.instance).add('Name', `${projectName}-nginx`);
@@ -217,7 +258,7 @@ export class Ec2NginxStack extends cdk.Stack {
         protocol: elbv2.ApplicationProtocol.HTTP,
         targets: [new elbv2_targets.InstanceTarget(this.instance, 80)],
         healthCheck: {
-          path: '/',
+          path: '/nginx-health',
           healthyHttpCodes: '200-399',
         },
       });
@@ -255,11 +296,11 @@ export class Ec2NginxStack extends cdk.Stack {
       });
       new cdk.CfnOutput(this, 'NginxHttpsBaseUrl', {
         value: `https://${httpsCfg.certificateDomainName}/`,
-        description: 'HTTPS base URL (primary cert name)',
+        description: 'HTTPS base URL — project-showcase (root /)',
       });
       new cdk.CfnOutput(this, 'NflQuizHttpsUrl', {
         value: cdk.Fn.join('', ['https://', httpsCfg.certificateDomainName, `${quizPath}/`]),
-        description: 'HTTPS nfl-quiz URL (primary name + path)',
+        description: 'HTTPS nfl-quiz URL',
       });
     } else {
       const eip = new ec2.CfnEIP(this, 'NginxEip', {
@@ -279,20 +320,21 @@ export class Ec2NginxStack extends cdk.Stack {
 
       new cdk.CfnOutput(this, 'NginxPublicIp', {
         value: eip.attrPublicIp,
-        description: 'Same as NginxElasticIp — http://IP/ and paths /app1/, /app2/, /nfl-quiz/',
+        description: 'Same as NginxElasticIp — / is project-showcase; also /nfl-quiz/, /app1/, /app2/',
       });
 
       new cdk.CfnOutput(this, 'NflQuizUrl', {
         value: cdk.Fn.join('', ['http://', eip.attrPublicIp, `${quizPath}/`]),
-        description: 'Base URL for the nfl-quiz app',
+        description: 'HTTP nfl-quiz URL',
       });
     }
 
     new cdk.CfnOutput(this, 'NginxInstanceId', { value: this.instance.instanceId });
 
-    new cdk.CfnOutput(this, 'NflQuizArtifactBucketName', {
+    new cdk.CfnOutput(this, 'Ec2NginxArtifactBucketName', {
       value: this.artifactBucket.bucketName,
-      description: 'S3 bucket for nfl-quiz release tarballs (prefix nfl-quiz/)',
+      description:
+        'S3 bucket for app deploy tarballs (prefix per app, e.g. nfl-quiz/, project-showcase/)',
     });
   }
 }

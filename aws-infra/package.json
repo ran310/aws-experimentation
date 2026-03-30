@@ -8,6 +8,7 @@
     "watch": "tsc -w",
     "cdk": "cdk",
     "synth": "cdk synth && node bin/generate-infra-artifacts.mjs",
+    "outputs:fetch": "node bin/fetch-stack-outputs.mjs",
     "diff": "cdk diff",
     "postinstall": "node scripts/patch-cdk-brace-expansion.cjs"
   },
