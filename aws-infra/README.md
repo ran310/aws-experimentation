@@ -40,7 +40,7 @@ Use the same **AWS CLI profile/region** as deploy (`AWS_PROFILE`, `AWS_REGION`, 
 | Stack ID | Purpose |
 |----------|---------|
 | `AwsInfra-Network` | VPC (2 AZs), public + private subnets, **one NAT**. |
-| `AwsInfra-Ec2Nginx` | **t4g.nano** + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). Root EBS is **30 GiB gp3** (see `ec2-nginx-stack.ts`) so large app installs (e.g. Python wheels) do not run out of disk. |
+| `AwsInfra-Ec2Nginx` | **t4g.nano** + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). Path routes include **`/`** (project-showcase), **`/nfl-quiz/`**, **`/deephaven-experiments/`**. Root EBS is **30 GiB gp3** (see `ec2-nginx-stack.ts`) so large app installs (e.g. Python wheels) do not run out of disk. |
 | `AwsInfra-ElastiCacheRedis` | Single-node **Redis** (`cache.t4g.micro`) in private subnets; allows Redis from the **EC2** security group on 6379. |
 | `AwsInfra-HttpApi` | **HTTP API (API Gateway v2)** + **Lambda** (Node 20, no VPC) — **JSON sample API** only. The **dashboard UI** is **not** here; use **`aws-infra-dashboard`**. |
 | `AwsInfra-Lakehouse-S3` | **S3** lake bucket (default name **`mylakehouse-{account}-{region}`**) + **IAM managed policies** for read-only vs read/write. Attach policies to any app role; organize data with **prefixes** (e.g. `raw/`, `curated/`). |

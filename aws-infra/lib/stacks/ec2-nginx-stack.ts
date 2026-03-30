@@ -19,6 +19,14 @@ import {
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
 
 /**
+ * Path prefix for deephaven-experiments (must match app APPLICATION_ROOT / nginx).
+ */
+export const DEEPHAVEN_EXPERIMENTS_PATH_PREFIX = '/deephaven-experiments';
+
+/** Upstream port for deephaven-experiments (must match systemd / deploy). */
+export const DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT = 8082;
+
+/**
  * Gunicorn port for project-showcase (served at `/` — must match deploy/remote-install.sh).
  */
 export const PROJECT_SHOWCASE_UPSTREAM_PORT = 8081;
@@ -46,7 +54,8 @@ function relativeAliasNames(cfg: PublicAlbHttpsContext): string[] {
 /**
  * Single t4g.nano in a public subnet: **project-showcase** is proxied to Gunicorn on
  * {@link PROJECT_SHOWCASE_UPSTREAM_PORT} at **`/`**; **nfl-quiz** on :8080 under
- * {@link NFL_QUIZ_PATH_PREFIX}. ALB health checks **`/nginx-health`** so the target stays healthy
+ * {@link NFL_QUIZ_PATH_PREFIX}; **deephaven-experiments** on {@link DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT}
+ * under {@link DEEPHAVEN_EXPERIMENTS_PATH_PREFIX}. ALB health checks **`/nginx-health`** so the target stays healthy
  * before the showcase app is installed.
  *
  * Either **Elastic IP** + open 80/443 to the world, or **publicAlbHttps** (ACM + ALB + Route 53)
@@ -65,6 +74,8 @@ export class Ec2NginxStack extends cdk.Stack {
 
     const { vpc, projectName, publicAlbHttps: httpsCfg } = props;
     const quizPath = NFL_QUIZ_PATH_PREFIX;
+    const deephavenPath = DEEPHAVEN_EXPERIMENTS_PATH_PREFIX;
+    const deephavenPort = DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT;
     const showcasePort = PROJECT_SHOWCASE_UPSTREAM_PORT;
 
     this.artifactBucket = new s3.Bucket(this, 'NflQuizArtifacts', {
@@ -109,6 +120,7 @@ export class Ec2NginxStack extends cdk.Stack {
     this.artifactBucket.grantRead(role, 'nfl-quiz/*');
     /** Tarballs for project-showcase (GitHub → S3 → SSM pull on instance). */
     this.artifactBucket.grantRead(role, 'project-showcase/*');
+    this.artifactBucket.grantRead(role, 'deephaven-experiments/*');
 
     const userData = ec2.UserData.forLinux();
     const nginxConfPath = `/etc/nginx/conf.d/${projectName}-apps.conf`;
@@ -136,6 +148,20 @@ export class Ec2NginxStack extends cdk.Stack {
       '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
       '        proxy_set_header X-Forwarded-Proto $scheme;',
       `        proxy_set_header X-Forwarded-Prefix ${quizPath};`,
+      '    }',
+      '',
+      `    location = ${deephavenPath} {`,
+      `        return 301 ${deephavenPath}/;`,
+      '    }',
+      '',
+      `    location ${deephavenPath}/ {`,
+      `        proxy_pass http://127.0.0.1:${deephavenPort}/;`,
+      '        proxy_http_version 1.1;',
+      '        proxy_set_header Host $host;',
+      '        proxy_set_header X-Real-IP $remote_addr;',
+      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+      '        proxy_set_header X-Forwarded-Proto $scheme;',
+      `        proxy_set_header X-Forwarded-Prefix ${deephavenPath};`,
       '    }',
       '',
       '    location /app1/ {',
@@ -185,15 +211,39 @@ export class Ec2NginxStack extends cdk.Stack {
       'WantedBy=multi-user.target',
     ].join('\n');
 
+    // Matches deephaven-experiments deploy/remote-install.sh: Flask lives under backend/; one Gunicorn
+    // worker because Deephaven embeds a singleton JVM.
+    const systemdUnitDeephaven = [
+      '[Unit]',
+      'Description=Deephaven experiments (Gunicorn + embedded Deephaven)',
+      'After=network.target',
+      '',
+      '[Service]',
+      'Type=simple',
+      'User=root',
+      'WorkingDirectory=/opt/deephaven-experiments/app',
+      'EnvironmentFile=/etc/deephaven-experiments.env',
+      `ExecStart=/opt/deephaven-experiments/venv/bin/gunicorn --bind 127.0.0.1:${deephavenPort} --workers 1 --threads 4 --timeout 180 backend.app:app`,
+      'Restart=on-failure',
+      'RestartSec=10',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+    ].join('\n');
+
     const nginxB64 = Buffer.from(nginxSite, 'utf8').toString('base64');
     const unitB64 = Buffer.from(systemdUnit, 'utf8').toString('base64');
+    const unitDeephavenB64 = Buffer.from(systemdUnitDeephaven, 'utf8').toString('base64');
 
     userData.addCommands(
       'set -euxo pipefail',
-      'dnf install -y nginx python3.11 python3.11-pip awscli',
+      'dnf install -y nginx python3.11 python3.11-pip awscli java-17-amazon-corretto-headless',
       'mkdir -p /opt/nfl-quiz/app',
       `printf '%s' 'APPLICATION_ROOT=${quizPath}' > /etc/nfl-quiz.env`,
       `printf '%s' '${unitB64}' | base64 -d > /etc/systemd/system/nfl-quiz.service`,
+      'mkdir -p /opt/deephaven-experiments/app',
+      `printf '%s\n' 'JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto' 'FLASK_PORT=${deephavenPort}' 'DEEPHAVEN_HEAP=-Xmx2g' 'DEEPHAVEN_PORT=10000' 'APPLICATION_ROOT=${deephavenPath}' > /etc/deephaven-experiments.env`,
+      `printf '%s' '${unitDeephavenB64}' | base64 -d > /etc/systemd/system/deephaven-experiments.service`,
       'systemctl daemon-reload',
       'mkdir -p /var/www/app1 /var/www/app2',
       'echo "<h1>App 1</h1><p>Path: /app1</p>" > /var/www/app1/index.html',
@@ -302,6 +352,10 @@ export class Ec2NginxStack extends cdk.Stack {
         value: cdk.Fn.join('', ['https://', httpsCfg.certificateDomainName, `${quizPath}/`]),
         description: 'HTTPS nfl-quiz URL',
       });
+      new cdk.CfnOutput(this, 'DeephavenExperimentsHttpsUrl', {
+        value: cdk.Fn.join('', ['https://', httpsCfg.certificateDomainName, `${deephavenPath}/`]),
+        description: 'HTTPS deephaven-experiments URL',
+      });
     } else {
       const eip = new ec2.CfnEIP(this, 'NginxEip', {
         domain: 'vpc',
@@ -320,12 +374,18 @@ export class Ec2NginxStack extends cdk.Stack {
 
       new cdk.CfnOutput(this, 'NginxPublicIp', {
         value: eip.attrPublicIp,
-        description: 'Same as NginxElasticIp — / is project-showcase; also /nfl-quiz/, /app1/, /app2/',
+        description:
+          'Same as NginxElasticIp — / is project-showcase; also /nfl-quiz/, /deephaven-experiments/, /app1/, /app2/',
       });
 
       new cdk.CfnOutput(this, 'NflQuizUrl', {
         value: cdk.Fn.join('', ['http://', eip.attrPublicIp, `${quizPath}/`]),
         description: 'HTTP nfl-quiz URL',
+      });
+
+      new cdk.CfnOutput(this, 'DeephavenExperimentsUrl', {
+        value: cdk.Fn.join('', ['http://', eip.attrPublicIp, `${deephavenPath}/`]),
+        description: 'HTTP deephaven-experiments URL',
       });
     }
 
@@ -334,7 +394,7 @@ export class Ec2NginxStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'Ec2NginxArtifactBucketName', {
       value: this.artifactBucket.bucketName,
       description:
-        'S3 bucket for app deploy tarballs (prefix per app, e.g. nfl-quiz/, project-showcase/)',
+        'S3 bucket for app deploy tarballs (prefix per app: nfl-quiz/, project-showcase/, deephaven-experiments/)',
     });
   }
 }
