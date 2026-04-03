@@ -148,6 +148,9 @@ export class Ec2NginxStack extends cdk.Stack {
     role.addToPolicy(new iam.PolicyStatement({
       sid: 'HealthDashboardReadOnly',
       actions: [
+        // ListStacks: required for "list all stacks" (CLI + boto3 paginator paths).
+        // DescribeStacks alone is not always sufficient on the instance role.
+        'cloudformation:ListStacks',
         'cloudformation:DescribeStacks',
         'cloudwatch:GetMetricStatistics',
         'cloudwatch:ListMetrics',
