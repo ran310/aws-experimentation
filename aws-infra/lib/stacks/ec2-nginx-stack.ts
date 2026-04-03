@@ -246,6 +246,7 @@ export class Ec2NginxStack extends cdk.Stack {
       '[Unit]',
       'Description=NFL Quiz (Gunicorn)',
       'After=network.target',
+      'ConditionPathExists=/opt/nfl-quiz/venv/bin/gunicorn',
       '',
       '[Service]',
       'Type=simple',
@@ -255,7 +256,6 @@ export class Ec2NginxStack extends cdk.Stack {
       'ExecStart=/opt/nfl-quiz/venv/bin/gunicorn --bind 127.0.0.1:8080 app:app',
       'Restart=on-failure',
       'RestartSec=5',
-      'ConditionPathExists=/opt/nfl-quiz/venv/bin/gunicorn',
       '',
       '[Install]',
       'WantedBy=multi-user.target',
@@ -267,6 +267,7 @@ export class Ec2NginxStack extends cdk.Stack {
       '[Unit]',
       'Description=Deephaven experiments (Gunicorn + embedded Deephaven)',
       'After=network.target',
+      'ConditionPathExists=/opt/deephaven-experiments/venv/bin/gunicorn',
       '',
       '[Service]',
       'Type=simple',
@@ -276,7 +277,6 @@ export class Ec2NginxStack extends cdk.Stack {
       `ExecStart=/opt/deephaven-experiments/venv/bin/gunicorn --bind 127.0.0.1:${deephavenPort} --workers 1 --threads 4 --timeout 300 backend.app:app`,
       'Restart=on-failure',
       'RestartSec=10',
-      'ConditionPathExists=/opt/deephaven-experiments/venv/bin/gunicorn',
       '',
       '[Install]',
       'WantedBy=multi-user.target',
@@ -343,11 +343,13 @@ export class Ec2NginxStack extends cdk.Stack {
     });
 
     cdk.Tags.of(this.instance).add('Name', `${projectName}-nginx`);
-    // Shared tag: all apps on this host (aws-health-dashboard, nfl-quiz, project-showcase, deephaven) use
-    // the same CodeDeploy application + deployment group; each revision ships its own appspec + hooks.
+    // Shared tag: every nginx app repo targets this instance. Use one CodeDeploy application but
+    // **separate deployment groups per app** so each group keeps its own last-successful revision.
+    // A single shared deployment group would interleave revisions across repos and can run the wrong
+    // ApplicationStop / lifecycle hooks for the next deploy.
     cdk.Tags.of(this.instance).add('Ec2NginxCodeDeploy', 'true');
 
-    // ── CodeDeploy (shared by every nginx app repo) ───────────────────────
+    // ── CodeDeploy (one application, one deployment group per nginx app repo) ──
     const codeDeployServiceRole = new iam.Role(this, 'CodeDeployServiceRole', {
       assumedBy: new iam.ServicePrincipal('codedeploy.amazonaws.com'),
       managedPolicies: [
@@ -359,24 +361,54 @@ export class Ec2NginxStack extends cdk.Stack {
       applicationName: `${projectName}-ec2-nginx-apps`,
     });
 
-    const deploymentGroup = new codedeploy.ServerDeploymentGroup(this, 'NginxSharedDeploymentGroup', {
+    const nginxCodeDeployTags = new codedeploy.InstanceTagSet({
+      Ec2NginxCodeDeploy: ['true'],
+    });
+
+    const dgBase = {
       application: codeDeployApp,
-      deploymentGroupName: `${projectName}-ec2-nginx-dg`,
       role: codeDeployServiceRole,
-      ec2InstanceTags: new codedeploy.InstanceTagSet({
-        Ec2NginxCodeDeploy: ['true'],
-      }),
+      ec2InstanceTags: nginxCodeDeployTags,
       installAgent: false,
       deploymentConfig: codedeploy.ServerDeploymentConfig.ONE_AT_A_TIME,
+    };
+
+    const dgProjectShowcase = new codedeploy.ServerDeploymentGroup(this, 'DgProjectShowcase', {
+      ...dgBase,
+      deploymentGroupName: `${projectName}-ec2-nginx-dg-project-showcase`,
+    });
+    const dgNflQuiz = new codedeploy.ServerDeploymentGroup(this, 'DgNflQuiz', {
+      ...dgBase,
+      deploymentGroupName: `${projectName}-ec2-nginx-dg-nfl-quiz`,
+    });
+    const dgAwsHealthDashboard = new codedeploy.ServerDeploymentGroup(this, 'DgAwsHealthDashboard', {
+      ...dgBase,
+      deploymentGroupName: `${projectName}-ec2-nginx-dg-aws-health-dashboard`,
+    });
+    const dgDeephavenExperiments = new codedeploy.ServerDeploymentGroup(this, 'DgDeephavenExperiments', {
+      ...dgBase,
+      deploymentGroupName: `${projectName}-ec2-nginx-dg-deephaven-experiments`,
     });
 
     new cdk.CfnOutput(this, 'CodeDeployAppName', {
       value: codeDeployApp.applicationName,
-      description: 'Shared CodeDeploy app — aws-health-dashboard, nfl-quiz, project-showcase, deephaven-experiments',
+      description: 'Shared CodeDeploy application — same for all nginx app workflows',
     });
-    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupName', {
-      value: deploymentGroup.deploymentGroupName,
-      description: 'Shared CodeDeploy deployment group — same for all nginx app workflows',
+    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupNameProjectShowcase', {
+      value: dgProjectShowcase.deploymentGroupName,
+      description: 'project-showcase workflow: use this deployment group name',
+    });
+    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupNameNflQuiz', {
+      value: dgNflQuiz.deploymentGroupName,
+      description: 'nfl-quiz workflow: use this deployment group name',
+    });
+    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupNameAwsHealthDashboard', {
+      value: dgAwsHealthDashboard.deploymentGroupName,
+      description: 'aws-health-dashboard workflow: use this deployment group name',
+    });
+    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupNameDeephavenExperiments', {
+      value: dgDeephavenExperiments.deploymentGroupName,
+      description: 'deephaven-experiments workflow: use this deployment group name',
     });
 
     if (httpsCfg && albSg) {
