@@ -17,6 +17,7 @@
     "@aws-cdk/core:newStyleStackSynthesis": true,
     "@aws-cdk/aws-apigateway:disableCloudWatchRole": false,
     "projectName": "learn-aws",
+    "githubOwner": "ran310",
     "publicAlbHttps": {
       "hostedZoneId": "Z00475116AGAJ2WM26GG",
       "zoneName": "ram-narayanan.com",

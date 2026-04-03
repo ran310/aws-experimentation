@@ -1,5 +1,6 @@
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cdk from 'aws-cdk-lib';
+import * as codedeploy from 'aws-cdk-lib/aws-codedeploy';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as elbv2_targets from 'aws-cdk-lib/aws-elasticloadbalancingv2-targets';
@@ -17,6 +18,12 @@ import {
 
 /** Path prefix where nfl-quiz is served (must match Flask APPLICATION_ROOT / nginx). */
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
+
+/** Path prefix for the AWS health dashboard (must match app APPLICATION_ROOT / nginx). */
+export const AWS_HEALTH_DASHBOARD_PATH_PREFIX = '/aws-health';
+
+/** Gunicorn port for aws-health-dashboard (must match deploy/application_start.sh). */
+export const AWS_HEALTH_DASHBOARD_UPSTREAM_PORT = 8083;
 
 /**
  * Path prefix for deephaven-experiments (must match app APPLICATION_ROOT / nginx).
@@ -80,6 +87,8 @@ export class Ec2NginxStack extends cdk.Stack {
     const deephavenPath = DEEPHAVEN_EXPERIMENTS_PATH_PREFIX;
     const deephavenPort = DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT;
     const showcasePort = PROJECT_SHOWCASE_UPSTREAM_PORT;
+    const healthDashPath = AWS_HEALTH_DASHBOARD_PATH_PREFIX;
+    const healthDashPort = AWS_HEALTH_DASHBOARD_UPSTREAM_PORT;
 
     this.artifactBucket = new s3.Bucket(this, 'NflQuizArtifacts', {
       bucketName: `${projectName}-nfl-quiz-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
@@ -117,6 +126,9 @@ export class Ec2NginxStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+        // Required by the CodeDeploy agent to download deployment bundles from S3.
+        // Policy ARN is .../policy/service-role/AmazonEC2RoleforAWSCodeDeploy (not .../policy/AmazonEC2RoleforAWSCodeDeploy).
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonEC2RoleforAWSCodeDeploy'),
       ],
     });
 
@@ -124,6 +136,31 @@ export class Ec2NginxStack extends cdk.Stack {
     /** Tarballs for project-showcase (GitHub → S3 → SSM pull on instance). */
     this.artifactBucket.grantRead(role, 'project-showcase/*');
     this.artifactBucket.grantRead(role, 'deephaven-experiments/*');
+    /** CodeDeploy bundles for aws-health-dashboard (GitHub → S3 → CodeDeploy). */
+    this.artifactBucket.grantRead(role, 'aws-health-dashboard/*');
+
+    // Read-only AWS permissions needed by the health dashboard backend (boto3).
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'HealthDashboardReadOnly',
+      actions: [
+        'cloudformation:DescribeStacks',
+        'cloudwatch:GetMetricStatistics',
+        'cloudwatch:ListMetrics',
+        'ec2:DescribeInstances',
+        'ec2:DescribeInstanceStatus',
+        'lambda:ListFunctions',
+        'elasticache:DescribeCacheClusters',
+        'apigateway:GET',
+        's3:ListAllMyBuckets',
+        's3:GetBucketLocation',
+        // AWS Health requires Business/Enterprise support; safe to include —
+        // the app handles AccessDeniedException gracefully.
+        'health:DescribeEvents',
+        'health:DescribeEventDetails',
+        'health:DescribeAffectedEntities',
+      ],
+      resources: ['*'],
+    }));
 
     const userData = ec2.UserData.forLinux();
     const nginxConfPath = `/etc/nginx/conf.d/${projectName}-apps.conf`;
@@ -170,6 +207,20 @@ export class Ec2NginxStack extends cdk.Stack {
       '    location /app2/ {',
       '        alias /var/www/app2/;',
       '        index index.html;',
+      '    }',
+      '',
+      `    location = ${healthDashPath} {`,
+      `        return 301 ${healthDashPath}/;`,
+      '    }',
+      '',
+      `    location ${healthDashPath}/ {`,
+      `        proxy_pass http://127.0.0.1:${healthDashPort}/;`,
+      '        proxy_http_version 1.1;',
+      '        proxy_set_header Host $host;',
+      '        proxy_set_header X-Real-IP $remote_addr;',
+      '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+      '        proxy_set_header X-Forwarded-Proto $scheme;',
+      `        proxy_set_header X-Forwarded-Prefix ${healthDashPath};`,
       '    }',
       '',
       '    location = /project-showcase {',
@@ -237,7 +288,15 @@ export class Ec2NginxStack extends cdk.Stack {
 
     userData.addCommands(
       'set -euxo pipefail',
-      'dnf install -y nginx python3.11 python3.11-pip awscli java-17-amazon-corretto-headless',
+      'dnf install -y nginx python3.11 python3.11-pip awscli java-17-amazon-corretto-headless ruby',
+      // CodeDeploy agent — needed for aws-health-dashboard deployments.
+      // NOTE: only runs on fresh instance launches; to install on an existing instance,
+      // run this block manually via SSM or SSH.
+      `wget -q -O /tmp/codedeploy-install https://aws-codedeploy-${cdk.Aws.REGION}.s3.${cdk.Aws.REGION}.amazonaws.com/latest/install`,
+      'chmod +x /tmp/codedeploy-install',
+      '/tmp/codedeploy-install auto',
+      'systemctl enable codedeploy-agent',
+      'systemctl start codedeploy-agent',
       'mkdir -p /opt/nfl-quiz/app',
       `printf '%s' 'APPLICATION_ROOT=${quizPath}' > /etc/nfl-quiz.env`,
       `printf '%s' '${unitB64}' | base64 -d > /etc/systemd/system/nfl-quiz.service`,
@@ -284,6 +343,41 @@ export class Ec2NginxStack extends cdk.Stack {
     });
 
     cdk.Tags.of(this.instance).add('Name', `${projectName}-nginx`);
+    // Shared tag: all apps on this host (aws-health-dashboard, nfl-quiz, project-showcase, deephaven) use
+    // the same CodeDeploy application + deployment group; each revision ships its own appspec + hooks.
+    cdk.Tags.of(this.instance).add('Ec2NginxCodeDeploy', 'true');
+
+    // ── CodeDeploy (shared by every nginx app repo) ───────────────────────
+    const codeDeployServiceRole = new iam.Role(this, 'CodeDeployServiceRole', {
+      assumedBy: new iam.ServicePrincipal('codedeploy.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSCodeDeployRole'),
+      ],
+    });
+
+    const codeDeployApp = new codedeploy.ServerApplication(this, 'NginxSharedCodeDeployApp', {
+      applicationName: `${projectName}-ec2-nginx-apps`,
+    });
+
+    const deploymentGroup = new codedeploy.ServerDeploymentGroup(this, 'NginxSharedDeploymentGroup', {
+      application: codeDeployApp,
+      deploymentGroupName: `${projectName}-ec2-nginx-dg`,
+      role: codeDeployServiceRole,
+      ec2InstanceTags: new codedeploy.InstanceTagSet({
+        Ec2NginxCodeDeploy: ['true'],
+      }),
+      installAgent: false,
+      deploymentConfig: codedeploy.ServerDeploymentConfig.ONE_AT_A_TIME,
+    });
+
+    new cdk.CfnOutput(this, 'CodeDeployAppName', {
+      value: codeDeployApp.applicationName,
+      description: 'Shared CodeDeploy app — aws-health-dashboard, nfl-quiz, project-showcase, deephaven-experiments',
+    });
+    new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupName', {
+      value: deploymentGroup.deploymentGroupName,
+      description: 'Shared CodeDeploy deployment group — same for all nginx app workflows',
+    });
 
     if (httpsCfg && albSg) {
       const hostedZone = route53.HostedZone.fromHostedZoneAttributes(this, 'PublicZone', {

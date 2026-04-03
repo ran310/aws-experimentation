@@ -7,6 +7,7 @@ import {
 } from '../lib/config';
 import { Ec2NginxStack } from '../lib/stacks/ec2-nginx-stack';
 import { ElastiCacheRedisStack } from '../lib/stacks/elasticache-redis-stack';
+import { GitHubOidcStack } from '../lib/stacks/github-oidc-stack';
 import { HttpApiStack } from '../lib/stacks/http-api-stack';
 import { LakehouseStack } from '../lib/stacks/lakehouse-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
@@ -52,4 +53,11 @@ new LakehouseStack(app, 'AwsInfra-Lakehouse-S3', {
   env,
   projectName: name,
   bucketName: lakehouseBucketNameFromContext(app),
+});
+
+new GitHubOidcStack(app, 'AwsInfra-GitHubOidc', {
+  env,
+  projectName: name,
+  githubOwner: app.node.tryGetContext('githubOwner') ?? 'ran310',
+  artifactBucket: ec2Nginx.artifactBucket,
 });
