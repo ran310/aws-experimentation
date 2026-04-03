@@ -15,7 +15,7 @@ For a **local browser dashboard** (Python + React) that lists stacks, resources,
 | `generated/stacks-overview.json` | Stack IDs, template descriptions, resource counts/types, outputs. |
 | `generated/architecture.mmd` | Mermaid diagram of the same topology (for docs or the dashboard). |
 
-See [`generated/README.md`](generated/README.md).
+The **`generated/`** directory is **gitignored**; run `npm run synth` locally (or in CI) to create these files after clone.
 
 ## Deployed stack outputs (AWS CLI)
 
