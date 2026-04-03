@@ -1,6 +1,7 @@
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cdk from 'aws-cdk-lib';
 import * as codedeploy from 'aws-cdk-lib/aws-codedeploy';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as elbv2_targets from 'aws-cdk-lib/aws-elasticloadbalancingv2-targets';
@@ -8,7 +9,9 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53_targets from 'aws-cdk-lib/aws-route53-targets';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { Construct } from 'constructs';
 import {
   fqdnToRelativeRecordName,
@@ -138,6 +141,8 @@ export class Ec2NginxStack extends cdk.Stack {
     this.artifactBucket.grantRead(role, 'deephaven-experiments/*');
     /** CodeDeploy bundles for aws-health-dashboard (GitHub → S3 → CodeDeploy). */
     this.artifactBucket.grantRead(role, 'aws-health-dashboard/*');
+    /** Canonical nginx site config (S3 → SSM on each Ec2Nginx deploy). */
+    this.artifactBucket.grantRead(role, 'nginx-config/*');
 
     // Read-only AWS permissions needed by the health dashboard backend (boto3).
     role.addToPolicy(new iam.PolicyStatement({
@@ -348,6 +353,62 @@ export class Ec2NginxStack extends cdk.Stack {
     // A single shared deployment group would interleave revisions across repos and can run the wrong
     // ApplicationStop / lifecycle hooks for the next deploy.
     cdk.Tags.of(this.instance).add('Ec2NginxCodeDeploy', 'true');
+
+    // ── Nginx config: S3 + SSM on every deploy (user-data only runs at launch) ─────────
+    const nginxObjectKey = `${projectName}-apps.conf`;
+    const nginxS3Key = `nginx-config/${nginxObjectKey}`;
+    const nginxConfigHash = createHash('sha256').update(nginxSite).digest('hex').slice(0, 32);
+
+    const nginxBucketDeploy = new s3deploy.BucketDeployment(this, 'NginxConfigToS3', {
+      sources: [s3deploy.Source.data(nginxObjectKey, nginxSite)],
+      destinationBucket: this.artifactBucket,
+      destinationKeyPrefix: 'nginx-config/',
+      prune: false,
+      memoryLimit: 256,
+    });
+
+    const skipNginxSsm =
+      this.node.tryGetContext('skipNginxSsmApply') === true ||
+      this.node.tryGetContext('skipNginxSsmApply') === 'true';
+
+    if (!skipNginxSsm) {
+      const applyNginxScript = [
+        '#!/bin/bash',
+        'set -euxo pipefail',
+        `CONF=${nginxConfPath}`,
+        `aws s3 cp "s3://${this.artifactBucket.bucketName}/${nginxS3Key}" /tmp/nginx-apps.new`,
+        'install -m 644 /tmp/nginx-apps.new "$CONF"',
+        'rm -f /tmp/nginx-apps.new',
+        'if [[ -f /etc/nginx/conf.d/default.conf ]]; then mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.cdk-disabled; fi',
+        'nginx -t',
+        'systemctl reload nginx',
+      ].join('\n');
+
+      const ssmApply: cr.AwsSdkCall = {
+        service: 'SSM',
+        action: 'sendCommand',
+        parameters: {
+          DocumentName: 'AWS-RunShellScript',
+          Parameters: { commands: [applyNginxScript] },
+          Targets: [{ Key: 'tag:Ec2NginxCodeDeploy', Values: ['true'] }],
+          TimeoutSeconds: 120,
+          MaxConcurrency: '1',
+          MaxErrors: '1',
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(nginxConfigHash),
+      };
+
+      const applyNginxOnInstance = new cr.AwsCustomResource(this, 'ApplyNginxConfigViaSsm', {
+        onCreate: ssmApply,
+        onUpdate: ssmApply,
+        policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+          resources: cr.AwsCustomResourcePolicy.ANY_RESOURCE,
+        }),
+        installLatestAwsSdk: true,
+      });
+      applyNginxOnInstance.node.addDependency(this.instance);
+      applyNginxOnInstance.node.addDependency(nginxBucketDeploy);
+    }
 
     // ── CodeDeploy (one application, one deployment group per nginx app repo) ──
     const codeDeployServiceRole = new iam.Role(this, 'CodeDeployServiceRole', {
