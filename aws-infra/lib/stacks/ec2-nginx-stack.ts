@@ -51,8 +51,11 @@ function relativeAliasNames(cfg: PublicAlbHttpsContext): string[] {
   return [...new Set(rel)];
 }
 
+/** Default nginx host: **8 GiB RAM** (t4g.large). Override in code if you want a different size. */
+export const EC2_NGINX_INSTANCE_SIZE = ec2.InstanceSize.LARGE;
+
 /**
- * Single t4g.nano in a public subnet: **project-showcase** is proxied to Gunicorn on
+ * Single Graviton instance (see {@link EC2_NGINX_INSTANCE_SIZE}) in a public subnet: **project-showcase** is proxied to Gunicorn on
  * {@link PROJECT_SHOWCASE_UPSTREAM_PORT} at **`/`**; **nfl-quiz** on :8080 under
  * {@link NFL_QUIZ_PATH_PREFIX}; **deephaven-experiments** on {@link DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT}
  * under {@link DEEPHAVEN_EXPERIMENTS_PATH_PREFIX}. ALB health checks **`/nginx-health`** so the target stays healthy
@@ -69,7 +72,7 @@ export class Ec2NginxStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: Ec2NginxStackProps) {
     super(scope, id, {
       ...props,
-      description: stackDescription('EC2 t4g.nano + nginx multi-app paths'),
+      description: stackDescription('EC2 t4g + nginx multi-app paths'),
     });
 
     const { vpc, projectName, publicAlbHttps: httpsCfg } = props;
@@ -164,10 +167,6 @@ export class Ec2NginxStack extends cdk.Stack {
       `        proxy_set_header X-Forwarded-Prefix ${deephavenPath};`,
       '    }',
       '',
-      '    location /app1/ {',
-      '        alias /var/www/app1/;',
-      '        index index.html;',
-      '    }',
       '    location /app2/ {',
       '        alias /var/www/app2/;',
       '        index index.html;',
@@ -223,9 +222,10 @@ export class Ec2NginxStack extends cdk.Stack {
       'User=root',
       'WorkingDirectory=/opt/deephaven-experiments/app',
       'EnvironmentFile=/etc/deephaven-experiments.env',
-      `ExecStart=/opt/deephaven-experiments/venv/bin/gunicorn --bind 127.0.0.1:${deephavenPort} --workers 1 --threads 4 --timeout 180 backend.app:app`,
+      `ExecStart=/opt/deephaven-experiments/venv/bin/gunicorn --bind 127.0.0.1:${deephavenPort} --workers 1 --threads 4 --timeout 300 backend.app:app`,
       'Restart=on-failure',
       'RestartSec=10',
+      'ConditionPathExists=/opt/deephaven-experiments/venv/bin/gunicorn',
       '',
       '[Install]',
       'WantedBy=multi-user.target',
@@ -242,7 +242,8 @@ export class Ec2NginxStack extends cdk.Stack {
       `printf '%s' 'APPLICATION_ROOT=${quizPath}' > /etc/nfl-quiz.env`,
       `printf '%s' '${unitB64}' | base64 -d > /etc/systemd/system/nfl-quiz.service`,
       'mkdir -p /opt/deephaven-experiments/app',
-      `printf '%s\n' 'JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto' 'FLASK_PORT=${deephavenPort}' 'DEEPHAVEN_HEAP=-Xmx2g' 'DEEPHAVEN_PORT=10000' 'APPLICATION_ROOT=${deephavenPath}' > /etc/deephaven-experiments.env`,
+      // t4g.large baseline (8 GiB RAM). Tune in /etc/deephaven-experiments.env after deploy if needed.
+      `printf '%s\n' 'JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto' 'FLASK_PORT=${deephavenPort}' 'DEEPHAVEN_HEAP=-Xmx4g' 'DEEPHAVEN_PORT=10000' 'APPLICATION_ROOT=${deephavenPath}' > /etc/deephaven-experiments.env`,
       `printf '%s' '${unitDeephavenB64}' | base64 -d > /etc/systemd/system/deephaven-experiments.service`,
       'systemctl daemon-reload',
       'mkdir -p /var/www/app1 /var/www/app2',
@@ -257,10 +258,13 @@ export class Ec2NginxStack extends cdk.Stack {
     // Default AL2023 root is often 8 GiB — too small for large pip installs (e.g. Deephaven). GP3 is cost-effective.
     const rootVolumeGiB = 30;
 
-    this.instance = new ec2.Instance(this, 'NginxHost', {
+    // Logical ID is part of the CloudFormation resource name. If the instance is terminated in the
+    // console, bump this id (e.g. V2 → V3) so the next deploy creates a fresh instance; an unchanged
+    // template usually will not "heal" a missing EC2.
+    this.instance = new ec2.Instance(this, 'NginxHostV2', {
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.NANO),
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, EC2_NGINX_INSTANCE_SIZE),
       machineImage: ec2.MachineImage.latestAmazonLinux2023({
         cpuType: ec2.AmazonLinuxCpuType.ARM_64,
       }),
