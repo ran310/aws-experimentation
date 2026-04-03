@@ -1,5 +1,6 @@
 node_modules
 cdk.out
+generated/
 .cdk.staging
 *.swp
 .DS_Store
