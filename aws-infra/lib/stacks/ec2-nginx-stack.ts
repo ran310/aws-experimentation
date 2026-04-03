@@ -22,6 +22,9 @@ import {
 /** Path prefix where nfl-quiz is served (must match Flask APPLICATION_ROOT / nginx). */
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
 
+/** Gunicorn port for nfl-quiz (must match deploy/application_start.sh and nginx). */
+export const NFL_QUIZ_UPSTREAM_PORT = 8080;
+
 /** Path prefix for the AWS health dashboard (must match app APPLICATION_ROOT / nginx). */
 export const AWS_HEALTH_DASHBOARD_PATH_PREFIX = '/aws-health-dashboard';
 
@@ -66,7 +69,7 @@ export const EC2_NGINX_INSTANCE_SIZE = ec2.InstanceSize.LARGE;
 
 /**
  * Single Graviton instance (see {@link EC2_NGINX_INSTANCE_SIZE}) in a public subnet: **project-showcase** is proxied to Gunicorn on
- * {@link PROJECT_SHOWCASE_UPSTREAM_PORT} at **`/`**; **nfl-quiz** on :8080 under
+ * {@link PROJECT_SHOWCASE_UPSTREAM_PORT} at **`/`**; **nfl-quiz** on {@link NFL_QUIZ_UPSTREAM_PORT} under
  * {@link NFL_QUIZ_PATH_PREFIX}; **deephaven-experiments** on {@link DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT}
  * under {@link DEEPHAVEN_EXPERIMENTS_PATH_PREFIX}. ALB health checks **`/nginx-health`** so the target stays healthy
  * before the showcase app is installed.
@@ -87,6 +90,7 @@ export class Ec2NginxStack extends cdk.Stack {
 
     const { vpc, projectName, publicAlbHttps: httpsCfg } = props;
     const quizPath = NFL_QUIZ_PATH_PREFIX;
+    const nflQuizPort = NFL_QUIZ_UPSTREAM_PORT;
     const deephavenPath = DEEPHAVEN_EXPERIMENTS_PATH_PREFIX;
     const deephavenPort = DEEPHAVEN_EXPERIMENTS_UPSTREAM_PORT;
     const showcasePort = PROJECT_SHOWCASE_UPSTREAM_PORT;
@@ -189,7 +193,7 @@ export class Ec2NginxStack extends cdk.Stack {
       '    }',
       '',
       `    location ${quizPath}/ {`,
-      '        proxy_pass http://127.0.0.1:8080/;',
+      `        proxy_pass http://127.0.0.1:${nflQuizPort}/;`,
       '        proxy_http_version 1.1;',
       '        proxy_set_header Host $host;',
       '        proxy_set_header X-Real-IP $remote_addr;',
@@ -261,7 +265,7 @@ export class Ec2NginxStack extends cdk.Stack {
       'User=root',
       'WorkingDirectory=/opt/nfl-quiz/app',
       'EnvironmentFile=/etc/nfl-quiz.env',
-      'ExecStart=/opt/nfl-quiz/venv/bin/gunicorn --bind 127.0.0.1:8080 app:app',
+      `ExecStart=/opt/nfl-quiz/venv/bin/gunicorn --bind 127.0.0.1:${nflQuizPort} app:app`,
       'Restart=on-failure',
       'RestartSec=5',
       '',
