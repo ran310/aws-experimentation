@@ -98,14 +98,9 @@ export class GitHubOidcStack extends cdk.Stack {
     }));
 
     // ── CodeDeploy ────────────────────────────────────────────────────────
-    // aws-health-dashboard uses CodeDeploy instead of SSM. These five actions
-    // are the minimum needed to push a revision and wait for it to succeed:
-    //
-    //  RegisterApplicationRevision — tell CodeDeploy where the S3 bundle is
-    //  CreateDeployment            — start the deployment
-    //  GetDeployment               — poll status (used by `aws deploy wait`)
-    //  GetDeploymentConfig         — read config during deployment creation
-    //  GetApplicationRevision      — verify the uploaded revision
+    // Deploy workflows: upload revision, create deployment, wait for success.
+    // ListDeployments is required for the "wait until deployment group idle" step
+    // (aws deploy list-deployments in GitHub Actions).
     this.role.addToPolicy(new iam.PolicyStatement({
       sid: 'CodeDeployPush',
       actions: [
@@ -114,6 +109,7 @@ export class GitHubOidcStack extends cdk.Stack {
         'codedeploy:GetDeployment',
         'codedeploy:GetDeploymentConfig',
         'codedeploy:GetApplicationRevision',
+        'codedeploy:ListDeployments',
       ],
       resources: ['*'],
     }));
