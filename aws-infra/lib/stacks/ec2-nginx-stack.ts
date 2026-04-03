@@ -20,7 +20,7 @@ import {
 export const NFL_QUIZ_PATH_PREFIX = '/nfl-quiz';
 
 /** Path prefix for the AWS health dashboard (must match app APPLICATION_ROOT / nginx). */
-export const AWS_HEALTH_DASHBOARD_PATH_PREFIX = '/aws-health';
+export const AWS_HEALTH_DASHBOARD_PATH_PREFIX = '/aws-health-dashboard';
 
 /** Gunicorn port for aws-health-dashboard (must match deploy/application_start.sh). */
 export const AWS_HEALTH_DASHBOARD_UPSTREAM_PORT = 8083;
