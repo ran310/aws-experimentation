@@ -28,12 +28,20 @@ const network = new NetworkStack(app, 'AwsInfra-Network', {
   projectName: name,
 });
 
+const lakehouse = new LakehouseStack(app, 'AwsInfra-Lakehouse-S3', {
+  env,
+  projectName: name,
+  bucketName: lakehouseBucketNameFromContext(app),
+});
+
 const ec2Nginx = new Ec2NginxStack(app, 'AwsInfra-Ec2Nginx', {
   env,
   projectName: name,
   vpc: network.vpc,
   publicAlbHttps: publicAlbHttpsConfig(app),
+  lakehouseBucket: lakehouse.bucket,
 });
+ec2Nginx.addDependency(lakehouse);
 
 const appTierClientSg = ec2Nginx.instanceSecurityGroup;
 
@@ -49,15 +57,9 @@ new HttpApiStack(app, 'AwsInfra-HttpApi', {
   projectName: name,
 });
 
-new LakehouseStack(app, 'AwsInfra-Lakehouse-S3', {
-  env,
-  projectName: name,
-  bucketName: lakehouseBucketNameFromContext(app),
-});
-
-new GitHubOidcStack(app, 'AwsInfra-GitHubOidc', {
+const githubOidc = new GitHubOidcStack(app, 'AwsInfra-GitHubOidc', {
   env,
   projectName: name,
   githubOwner: app.node.tryGetContext('githubOwner') ?? 'ran310',
-  artifactBucket: ec2Nginx.artifactBucket,
 });
+githubOidc.addDependency(ec2Nginx);

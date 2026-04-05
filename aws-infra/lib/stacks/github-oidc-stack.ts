@@ -1,8 +1,9 @@
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
-import { stackDescription } from '../config';
+import { ec2NginxArtifactBucketSsmParameterName, stackDescription } from '../config';
 
 export interface GitHubOidcStackProps extends cdk.StackProps {
   readonly projectName: string;
@@ -13,11 +14,6 @@ export interface GitHubOidcStackProps extends cdk.StackProps {
    * the `main` branch (enforced by the `sub` condition below).
    */
   readonly githubOwner: string;
-  /**
-   * The S3 bucket that holds deployment artifacts. Passed in from
-   * Ec2NginxStack so this stack does not need to know the bucket name.
-   */
-  readonly artifactBucket: s3.IBucket;
 }
 
 /**
@@ -32,6 +28,9 @@ export interface GitHubOidcStackProps extends cdk.StackProps {
  *
  * The role ARN is emitted as a CloudFormation output; copy it into the
  * `AWS_ROLE_TO_ASSUME` secret in every GitHub repo that deploys to this account.
+ *
+ * S3 PutObject is granted for the bucket name stored in SSM at
+ * `ec2NginxArtifactBucketSsmParameterName(projectName)` so this stack does not import the Ec2 stack.
  */
 export class GitHubOidcStack extends cdk.Stack {
   public readonly role: iam.Role;
@@ -42,7 +41,13 @@ export class GitHubOidcStack extends cdk.Stack {
       description: stackDescription('GitHub Actions OIDC federation role'),
     });
 
-    const { githubOwner, artifactBucket, projectName } = props;
+    const { githubOwner, projectName } = props;
+
+    const artifactBucketName = ssm.StringParameter.valueForStringParameter(
+      this,
+      ec2NginxArtifactBucketSsmParameterName(projectName),
+    );
+    const artifactBucket = s3.Bucket.fromBucketName(this, 'ArtifactBucket', artifactBucketName);
 
     // The GitHub OIDC provider is a singleton per AWS account — one provider
     // serves every repo / workflow. We reference it by ARN rather than

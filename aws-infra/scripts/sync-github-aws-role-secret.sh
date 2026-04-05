@@ -5,36 +5,41 @@
 #
 # Prerequisites:
 #   - gh  (https://cli.github.com/) — authenticated: gh auth login
-#   - For --from-stack: AWS CLI credentials (same account/region as the stack)
+#   - For reading the role ARN (default stack AwsInfra-GitHubOidc): AWS CLI credentials
 #
 # Usage (repository secrets — full owner/repo):
 #   export AWS_ROLE_TO_ASSUME_ARN='arn:aws:iam::123456789012:role/learn-aws-github-actions'
 #   ./sync-github-aws-role-secret.sh ran310/nfl-quiz ran310/aws-health-dashboard
 #
-#   ./sync-github-aws-role-secret.sh --from-stack AwsInfra-GitHubOidc \
-#     --file ~/code/github/deploy-repos.txt
+#   ./sync-github-aws-role-secret.sh --file ~/code/github/deploy-repos.txt
+#
+# Repos from CDK config (repoName in lib/config/ec2-nginx-apps.ts):
+#   ./sync-github-aws-role-secret.sh --from-ec2-nginx-apps   # ARN from AwsInfra-GitHubOidc by default
+#   ./sync-github-aws-role-secret.sh --from-ec2-nginx-apps /path/to/ec2-nginx-apps.ts --skip-secrets \
+#     --run-deploy-workflow
 #
 # Personal GitHub user (e.g. ran310 — not an organization):
 #   Run: gh auth login  # as that user, so private repos are included
-#   ./sync-github-aws-role-secret.sh --owner ran310 --from-stack AwsInfra-GitHubOidc
+#   ./sync-github-aws-role-secret.sh --owner ran310
 #   ./sync-github-aws-role-secret.sh --owner ran310 --dry-run   # list only
 #   Discovery uses GET /user/repos?type=owner when your gh login matches --owner.
 #
 # Discover repos under a GitHub Organization (company org, not a user account):
-#   ./sync-github-aws-role-secret.sh --owner my-company --from-stack ...
+#   ./sync-github-aws-role-secret.sh --owner my-company
 #
 # Organization-level secret (single secret shared by named repos under an ORG — not for personal users):
-#   ./sync-github-aws-role-secret.sh --org my-company --repos app1,app2 --from-stack ...
+#   ./sync-github-aws-role-secret.sh --org my-company --repos app1,app2 --value "$ARN"
 #
 # Files: one repository per line; # starts a comment; blank lines ignored.
 #   - Without --org: each line must be OWNER/REPO
 #   - With --org: each line is REPO (same org as --org)
 #
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 
 SECRET_NAME='AWS_ROLE_TO_ASSUME'
 ARN_VALUE=''
-CFN_STACK=''
+CFN_STACK='AwsInfra-GitHubOidc'
 CFN_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 DISCOVER_OWNER=''
 INCLUDE_FORKS='false'
@@ -44,6 +49,12 @@ ORG=''
 REPOS_CSV=''
 INPUT_FILE=''
 REPOS_FROM_ARGS=()
+FROM_EC2_NGINX_APPS='false'
+EC2_NGINX_APPS_FILE=''
+RUN_DEPLOY_WORKFLOW='false'
+DEPLOY_WORKFLOW_NAME='Deploy to AWS'
+DEPLOY_REF='main'
+SKIP_SECRETS='false'
 
 usage() {
   cat <<'EOF'
@@ -56,18 +67,23 @@ Options:
   --owner LOGIN           List all repos for LOGIN (GitHub org OR personal user; see Discovery)
   --include-forks         When using --owner, also include fork repositories
   --include-archived      When using --owner, also include archived repositories
-  --dry-run               With --owner: print repo names only; do not call gh secret set
+  --dry-run               Print resolved repo list only; no gh secret set or workflow dispatch
   --value ARN             Secret body (IAM role ARN)
-  --from-stack NAME       Read output GitHubActionsRoleArn from CloudFormation
+  --from-stack NAME       CloudFormation stack for GitHubActionsRoleArn (default: AwsInfra-GitHubOidc)
   --region REGION         Region for --from-stack (default: AWS_REGION or us-east-1)
   --secret-name NAME      Default: AWS_ROLE_TO_ASSUME
   --org ORG               GitHub Organization only: one org-level secret; repo names are short (no user accounts)
   --repos LIST            Comma-separated repos with --org (e.g. a,b,c)
   --file PATH             Newline-separated repo list (see script header)
+  --from-ec2-nginx-apps [PATH]  Add repos from repoName fields (default: ../lib/config/ec2-nginx-apps.ts)
+  --run-deploy-workflow   After each repo, run: gh workflow run (see --deploy-workflow-name)
+  --deploy-workflow-name NAME   Workflow name or file (default: Deploy to AWS)
+  --deploy-ref REF        Ref for workflow_dispatch (default: main)
+  --skip-secrets          Do not set secrets (use with --run-deploy-workflow for deploy-only)
   -h, --help              Show this help
 
 Environment:
-  AWS_ROLE_TO_ASSUME_ARN  Used as the secret value if --value / --from-stack omitted
+  AWS_ROLE_TO_ASSUME_ARN  If set, used before querying CloudFormation (--value still wins)
 
 Discovery (--owner):
   - Personal user: if LOGIN matches `gh api user` (same account you ran gh auth login with),
@@ -79,11 +95,13 @@ Discovery (--owner):
 
 Examples (personal user ran310):
   gh auth login   # as ran310
-  ./sync-github-aws-role-secret.sh --from-stack AwsInfra-GitHubOidc --owner ran310
+  ./sync-github-aws-role-secret.sh --owner ran310
+
+Examples (nginx apps from ec2-nginx-apps.ts + deploy workflows):
+  ./sync-github-aws-role-secret.sh --from-ec2-nginx-apps --run-deploy-workflow
 
 Examples (GitHub Organization):
-  ./sync-github-aws-role-secret.sh --org acme-corp --repos app1,app2 \\
-    --value "$AWS_ROLE_TO_ASSUME_ARN"
+  ./sync-github-aws-role-secret.sh --org acme-corp --repos app1,app2
 EOF
 }
 
@@ -118,7 +136,7 @@ resolve_arn() {
     printf '%s' "$out"
     return
   fi
-  echo 'ERROR: Provide --value, export AWS_ROLE_TO_ASSUME_ARN, or --from-stack' >&2
+  echo 'ERROR: Set --from-stack, or use --value / AWS_ROLE_TO_ASSUME_ARN (CFN_STACK was empty).' >&2
   exit 1
 }
 
@@ -139,6 +157,18 @@ append_repos_from_file_to_csv() {
     if [[ -n "$repos_list" ]]; then repos_list+=','; fi
     repos_list+="$line"
   done < <(read_repo_file_lines "$file")
+}
+
+# Prints owner/repo lines from ec2-nginx-apps.ts (repoName: 'owner/repo',).
+extract_repo_names_from_ec2_nginx_apps_ts() {
+  local file="$1"
+  [[ -f "$file" ]] || {
+    echo "ERROR: Not a file: $file" >&2
+    exit 1
+  }
+  grep -E '^[[:space:]]*repoName:' "$file" \
+    | sed -n "s/^[[:space:]]*repoName:[[:space:]]*['\"]\([^'\"]*\)['\"].*/\1/p" \
+    | sort -u
 }
 
 # Prints jq filter for one page array: emit .full_name per repo.
@@ -173,6 +203,10 @@ discover_repos_for_owner() {
 
   echo "WARN: ${owner} is not an org and is not the authenticated user (${me:-unknown}); listing public repos only." >&2
   gh api --paginate "/users/${owner}/repos" -q "$jq_filter"
+}
+
+dedupe_repo_lines() {
+  printf '%s\n' "$@" | grep -v '^[[:space:]]*$' | sort -u
 }
 
 while [[ $# -gt 0 ]]; do
@@ -225,6 +259,37 @@ while [[ $# -gt 0 ]]; do
       INPUT_FILE="${2:-}"
       shift 2
       ;;
+    --from-ec2-nginx-apps=*)
+      FROM_EC2_NGINX_APPS='true'
+      EC2_NGINX_APPS_FILE="${1#*=}"
+      shift
+      ;;
+    --from-ec2-nginx-apps)
+      FROM_EC2_NGINX_APPS='true'
+      if [[ -n "${2:-}" && "${2:0:1}" != '-' ]]; then
+        EC2_NGINX_APPS_FILE="$2"
+        shift 2
+      else
+        EC2_NGINX_APPS_FILE="${SCRIPT_DIR}/../lib/config/ec2-nginx-apps.ts"
+        shift
+      fi
+      ;;
+    --run-deploy-workflow)
+      RUN_DEPLOY_WORKFLOW='true'
+      shift
+      ;;
+    --deploy-workflow-name)
+      DEPLOY_WORKFLOW_NAME="${2:-}"
+      shift 2
+      ;;
+    --deploy-ref)
+      DEPLOY_REF="${2:-}"
+      shift 2
+      ;;
+    --skip-secrets)
+      SKIP_SECRETS='true'
+      shift
+      ;;
     -*)
       echo "ERROR: Unknown option: $1" >&2
       usage >&2
@@ -249,25 +314,16 @@ if [[ -n "$DISCOVER_OWNER" && ${#REPOS_FROM_ARGS[@]} -gt 0 ]]; then
   echo 'ERROR: --owner cannot be combined with positional owner/repo arguments' >&2
   exit 1
 fi
+if [[ -n "$ORG" && "$FROM_EC2_NGINX_APPS" == true ]]; then
+  echo 'ERROR: --from-ec2-nginx-apps uses owner/repo strings; do not combine with --org.' >&2
+  exit 1
+fi
 
 require_cmd gh
 gh auth status >/dev/null 2>&1 || {
   echo 'ERROR: gh is not authenticated. Run: gh auth login' >&2
   exit 1
 }
-
-if [[ "$DRY_RUN" == true && -z "$DISCOVER_OWNER" ]]; then
-  echo 'ERROR: --dry-run is only supported with --owner' >&2
-  exit 1
-fi
-
-ARN=''
-if [[ "$DRY_RUN" != true ]]; then
-  ARN="$(resolve_arn)"
-  if [[ ! "$ARN" =~ ^arn:aws:iam::[0-9]{12}:role/ ]]; then
-    echo "WARN: Value does not look like an IAM role ARN (continuing anyway): ${ARN:0:60}..." >&2
-  fi
-fi
 
 if [[ -n "$ORG" ]]; then
   repos_list="${REPOS_CSV:-}"
@@ -294,6 +350,18 @@ if [[ -n "$ORG" ]]; then
     echo 'ERROR: Organization mode needs --repos and/or --file and/or repo arguments' >&2
     exit 1
   fi
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "DRY RUN: org ${ORG} repos: ${repos_list}" >&2
+    exit 0
+  fi
+  if [[ "$SKIP_SECRETS" == true ]]; then
+    echo 'ERROR: --skip-secrets is not supported with --org (no per-repo loop).' >&2
+    exit 1
+  fi
+  ARN="$(resolve_arn)"
+  if [[ ! "$ARN" =~ ^arn:aws:iam::[0-9]{12}:role/ ]]; then
+    echo "WARN: Value does not look like an IAM role ARN (continuing anyway): ${ARN:0:60}..." >&2
+  fi
   echo "Setting org secret ${SECRET_NAME} on org ${ORG} for repos: ${repos_list}"
   gh secret set "$SECRET_NAME" \
     --org "$ORG" \
@@ -301,6 +369,14 @@ if [[ -n "$ORG" ]]; then
     --visibility selected \
     --repos "$repos_list" \
     --body "$ARN"
+  if [[ "$RUN_DEPLOY_WORKFLOW" == true ]]; then
+    while IFS= read -r short; do
+      short="${short//[[:space:]]/}"
+      [[ -z "$short" ]] && continue
+      echo "Dispatching workflow ${DEPLOY_WORKFLOW_NAME} on ${ORG}/${short} (ref ${DEPLOY_REF})"
+      gh workflow run "$DEPLOY_WORKFLOW_NAME" --repo "${ORG}/${short}" --ref "$DEPLOY_REF"
+    done < <(echo "$repos_list" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  fi
   echo 'Done.'
   exit 0
 fi
@@ -317,11 +393,7 @@ if [[ -n "$DISCOVER_OWNER" ]]; then
     echo "ERROR: No repositories matched (after fork/archived filters). Try --include-forks / --include-archived." >&2
     exit 1
   fi
-  echo "Found ${#TARGET_REPOS[@]} repository(ies)." >&2
-  if [[ "$DRY_RUN" == true ]]; then
-    printf '%s\n' "${TARGET_REPOS[@]}"
-    exit 0
-  fi
+  echo "Found ${#TARGET_REPOS[@]} repository(ies) from --owner." >&2
 else
   if [[ -n "$INPUT_FILE" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -332,8 +404,20 @@ else
   TARGET_REPOS+=("${REPOS_FROM_ARGS[@]}")
 fi
 
+if [[ "$FROM_EC2_NGINX_APPS" == true ]]; then
+  [[ -n "$EC2_NGINX_APPS_FILE" ]] || EC2_NGINX_APPS_FILE="${SCRIPT_DIR}/../lib/config/ec2-nginx-apps.ts"
+  echo "Reading repoName entries from ${EC2_NGINX_APPS_FILE}..." >&2
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    TARGET_REPOS+=("$line")
+  done < <(extract_repo_names_from_ec2_nginx_apps_ts "$EC2_NGINX_APPS_FILE")
+fi
+
+# shellcheck disable=SC2207
+TARGET_REPOS=($(dedupe_repo_lines "${TARGET_REPOS[@]}"))
+
 if [[ ${#TARGET_REPOS[@]} -eq 0 ]]; then
-  echo 'ERROR: Pass owner/repo arguments, --file, or --owner LOGIN' >&2
+  echo 'ERROR: No repositories. Use owner/repo args, --file, --owner, and/or --from-ec2-nginx-apps.' >&2
   usage >&2
   exit 1
 fi
@@ -343,8 +427,35 @@ for repo in "${TARGET_REPOS[@]}"; do
     echo "ERROR: Expected OWNER/REPO, got: $repo" >&2
     exit 1
   fi
-  echo "Setting ${SECRET_NAME} on ${repo}"
-  gh secret set "$SECRET_NAME" --repo "$repo" --app actions --body "$ARN"
+done
+
+if [[ "$DRY_RUN" == true ]]; then
+  printf '%s\n' "${TARGET_REPOS[@]}"
+  exit 0
+fi
+
+if [[ "$SKIP_SECRETS" == true && "$RUN_DEPLOY_WORKFLOW" != true ]]; then
+  echo 'ERROR: --skip-secrets without --run-deploy-workflow leaves nothing to do.' >&2
+  exit 1
+fi
+
+ARN=''
+if [[ "$SKIP_SECRETS" != true ]]; then
+  ARN="$(resolve_arn)"
+  if [[ ! "$ARN" =~ ^arn:aws:iam::[0-9]{12}:role/ ]]; then
+    echo "WARN: Value does not look like an IAM role ARN (continuing anyway): ${ARN:0:60}..." >&2
+  fi
+fi
+
+for repo in "${TARGET_REPOS[@]}"; do
+  if [[ "$SKIP_SECRETS" != true ]]; then
+    echo "Setting ${SECRET_NAME} on ${repo}"
+    gh secret set "$SECRET_NAME" --repo "$repo" --app actions --body "$ARN"
+  fi
+  if [[ "$RUN_DEPLOY_WORKFLOW" == true ]]; then
+    echo "Dispatching workflow '${DEPLOY_WORKFLOW_NAME}' on ${repo} (ref ${DEPLOY_REF})"
+    gh workflow run "$DEPLOY_WORKFLOW_NAME" --repo "$repo" --ref "$DEPLOY_REF"
+  fi
 done
 
 echo 'Done.'

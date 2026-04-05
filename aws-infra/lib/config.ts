@@ -6,6 +6,14 @@ export function projectName(app: cdk.App): string {
 }
 
 /**
+ * SSM parameter written by Ec2NginxStack; GitHubOidcStack reads it so the GitHub role can grant
+ * S3 PutObject without a cross-stack export/import on the bucket.
+ */
+export function ec2NginxArtifactBucketSsmParameterName(projectName: string): string {
+  return `/${projectName}/ec2-nginx/artifact-bucket-name`;
+}
+
+/**
  * When set via context key `publicAlbHttps`, the EC2 stack provisions ACM (DNS validation),
  * an internet-facing ALB (TLS), Route 53 aliases, and restricts nginx :80 to the ALB only.
  * No Certbot or SSH required; destroy/recreate is fully CDK-driven.

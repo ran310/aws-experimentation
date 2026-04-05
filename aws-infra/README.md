@@ -40,7 +40,7 @@ Use the same **AWS CLI profile/region** as deploy (`AWS_PROFILE`, `AWS_REGION`, 
 | Stack ID | Purpose |
 |----------|---------|
 | `AwsInfra-Network` | VPC (2 AZs), public + private subnets, **one NAT**. |
-| `AwsInfra-Ec2Nginx` | **t4g.large** (**8 GiB** RAM by default; constant `EC2_NGINX_INSTANCE_SIZE` in `ec2-nginx-stack.ts`) + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`) for **hands-off HTTPS**; otherwise **Elastic IP** + direct **:80/:443**. **SSM** (no SSH on 22). Path routes include **`/`** (project-showcase), **`/nfl-quiz/`**, **`/deephaven-experiments/`**. Root EBS is **30 GiB gp3** (see `ec2-nginx-stack.ts`). |
+| `AwsInfra-Ec2Nginx` | **t4g.large** (**8 GiB** RAM by default; `EC2_NGINX_INSTANCE_SIZE` in `ec2-nginx-stack.ts`) + **nginx** + optional **ACM + ALB + Route 53** (context `publicAlbHttps`). **Which apps**, paths, ports, CodeDeploy groups, and optional user-data **systemd** are declared in **`lib/config/ec2-nginx-apps.ts`** (not hardcoded in the stack). Root EBS **30 GiB gp3**. |
 | `AwsInfra-ElastiCacheRedis` | Single-node **Redis** (`cache.t4g.micro`) in private subnets; allows Redis from the **EC2** security group on 6379. |
 | `AwsInfra-HttpApi` | **HTTP API (API Gateway v2)** + **Lambda** (Node 20, no VPC) — **JSON sample API** only. The **dashboard UI** is **not** here; use **`aws-infra-dashboard`**. |
 | `AwsInfra-Lakehouse-S3` | **S3** lake bucket (default name **`mylakehouse-{account}-{region}`**) + **IAM managed policies** for read-only vs read/write. Attach policies to any app role; organize data with **prefixes** (e.g. `raw/`, `curated/`). |
@@ -217,5 +217,5 @@ NAT Gateway, ElastiCache, and EC2 are usually **not free tier**. Tear down when 
 ## Extending
 
 - **New stack:** add under `lib/stacks/` and register in `bin/app.ts`; extend **`bin/generate-infra-artifacts.mjs`** if you want new nodes in `architecture.mmd`.
-- **More nginx apps:** extend user data in `ec2-nginx-stack.ts` (the **only** place that should write `/etc/nginx/conf.d/<projectName>-apps.conf`; app repos’ `remote-install.sh` scripts must not overwrite nginx).
+- **More nginx apps:** add an entry to **`lib/config/ec2-nginx-apps.ts`** (nginx + S3 + CodeDeploy are generated from that list). User-data still owns `/etc/nginx/conf.d/<projectName>-apps.conf`; app repos must not overwrite nginx.
 - **Lambda in VPC** talking to Redis (or future RDS): add a security group and allow it on the cache/DB stack (pattern similar to the EC2 SG today).
