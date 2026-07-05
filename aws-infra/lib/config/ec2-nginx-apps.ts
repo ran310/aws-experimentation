@@ -4,6 +4,9 @@
  */
 import * as iam from 'aws-cdk-lib/aws-iam';
 
+/** nginx `auth_basic_user_file` for Iceberg REST; user-data / SSM ensure it exists before nginx reload. */
+export const ICEBERG_CATALOG_HTPASSWD_PATH = '/etc/nginx/.htpasswd-iceberg-catalog';
+
 /** Convert kebab-id to PascalCase for CloudFormation OutputKey suffixes (matches GitHub Actions queries). */
 export function nginxAppIdToPascal(id: string): string {
   return id
@@ -61,6 +64,14 @@ export interface Ec2NginxAppDefinition {
    * Use for legacy redirects, static aliases, etc.
    */
   readonly nginxExtraLocations?: string[];
+  /**
+   * If set, HTTP Basic auth is applied to this app's proxy `location` blocks.
+   * `userFile` must exist on the instance (CodeDeploy or placeholder from user-data / SSM).
+   */
+  readonly nginxBasicAuth?: {
+    readonly realm: string;
+    readonly userFile: string;
+  };
   /** Attach the shared read-only IAM policy used by the AWS health dashboard (boto3). */
   readonly attachHealthDashboardInstancePolicy?: boolean;
   /**
@@ -72,6 +83,11 @@ export interface Ec2NginxAppDefinition {
    * Override CDK construct id for the HTTP URL output (EIP mode). Default: `HttpUrl{Pascal(id)}`.
    */
   readonly httpUrlOutputConstructId?: string;
+  /**
+   * Extra EC2 user-data shell lines (after CodeDeploy agent install).
+   * Use for mkdir, etc., when the app is deployed via CodeDeploy only.
+   */
+  readonly userDataExtra?: string[];
 }
 
 const healthDashboardReadOnlyPolicy = new iam.PolicyStatement({
@@ -170,6 +186,45 @@ export const EC2_NGINX_APPS: Ec2NginxAppDefinition[] = [
     upstreamPort: 8083,
     codeDeploy: true,
     attachHealthDashboardInstancePolicy: true,
+  },
+  {
+    id: 'city-distance-finder',
+    repoName: 'ran310/city-distance-finder',
+    s3ArtifactPrefix: 'city-distance-finder',
+    pathPrefix: '/city-distance-finder',
+    upstreamPort: 8086,
+    codeDeploy: true,
+    userDataBootstrap: {
+      optDir: '/opt/city-distance-finder',
+      systemdServiceName: 'city-distance-finder',
+      systemdDescription: 'City distance finder (Gunicorn)',
+      conditionPathExists: '/opt/city-distance-finder/venv/bin/gunicorn',
+      workingDirectory: '/opt/city-distance-finder/app',
+      environmentFile: '/etc/city-distance-finder.env',
+      execStart:
+        '/opt/city-distance-finder/venv/bin/gunicorn --bind 127.0.0.1:__PORT__ --workers 2 --threads 2 --timeout 120 app:app',
+    },
+  },
+  {
+    id: 'iceberg-catalog',
+    repoName: 'ran310/iceberg-catalog',
+    s3ArtifactPrefix: 'iceberg-catalog',
+    pathPrefix: '/iceberg-catalog',
+    upstreamPort: 8085,
+    codeDeploy: true,
+    nginxBasicAuth: {
+      realm: 'Iceberg REST',
+      userFile: ICEBERG_CATALOG_HTPASSWD_PATH,
+    },
+    userDataExtra: ['mkdir -p /var/lib/iceberg-catalog /opt/iceberg-catalog'],
+  },
+  {
+    id: 'magiccube-app',
+    repoName: 'ran310/magiccubeapp',
+    s3ArtifactPrefix: 'magiccube-app',
+    pathPrefix: '/magiccube-app',
+    upstreamPort: 8087,
+    codeDeploy: true,
   },
 ];
 

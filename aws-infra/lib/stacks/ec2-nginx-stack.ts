@@ -24,6 +24,7 @@ import {
   assertValidNginxApps,
   EC2_NGINX_APPS,
   healthDashboardPolicyStatement,
+  ICEBERG_CATALOG_HTPASSWD_PATH,
   nginxAppIdToPascal,
   type Ec2NginxAppDefinition,
 } from '../config/ec2-nginx-apps';
@@ -157,6 +158,12 @@ export class Ec2NginxStack extends cdk.Stack {
       ...apps.flatMap((a) => a.userDataExtra ?? []),
       'systemctl daemon-reload',
       ...staticDemoHtmlUserData(),
+      ...(apps.some((a) => a.nginxBasicAuth)
+        ? [
+            `install -m 640 /dev/null ${ICEBERG_CATALOG_HTPASSWD_PATH}`,
+            `chown root:nginx ${ICEBERG_CATALOG_HTPASSWD_PATH} || true`,
+          ]
+        : []),
       `printf '%s' '${nginxB64}' | base64 -d > ${nginxConfPath}`,
       'nginx -t',
       'systemctl enable nginx',
@@ -206,9 +213,19 @@ export class Ec2NginxStack extends cdk.Stack {
       this.node.tryGetContext('skipNginxSsmApply') === 'true';
 
     if (!skipNginxSsm) {
+      const htpasswdEnsure = apps.some((a) => a.nginxBasicAuth)
+        ? [
+            `HT=${ICEBERG_CATALOG_HTPASSWD_PATH}`,
+            'if [[ ! -f "$HT" ]]; then',
+            '  install -m 640 /dev/null "$HT"',
+            '  chown root:nginx "$HT" || chown root:root "$HT"',
+            'fi',
+          ].join('\n')
+        : '';
       const applyNginxScript = [
         '#!/bin/bash',
         'set -euxo pipefail',
+        htpasswdEnsure,
         `CONF=${nginxConfPath}`,
         `aws s3 cp "s3://${this.artifactBucket.bucketName}/${nginxS3Key}" /tmp/nginx-apps.new`,
         'install -m 644 /tmp/nginx-apps.new "$CONF"',

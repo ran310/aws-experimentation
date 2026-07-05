@@ -145,17 +145,29 @@ If the stack was created before the **30 GiB** root volume default, or you nee
 
 Changing **`blockDevices`** in CDK and redeploying may trigger **instance replacement**; use the console path above to grow disk **in place** on an existing host.
 
-### 6. HTTP API sample (Lambda JSON, not the dashboard)
+### 6. Redeploying applications on EC2 replacement
+
+If the EC2 instance gets replaced or recreated (which happens when you change certain properties in `AwsInfra-Ec2Nginx`), the brand new instance will boot up without any of your CodeDeploy applications. Only the apps with direct `userDataBootstrap` will run on boot.
+
+To quickly deploy all registered applications to the new instance via GitHub Actions, run:
+
+```bash
+./scripts/sync-github-aws-role-secret.sh --from-ec2-nginx-apps --skip-secrets --run-deploy-workflow
+```
+
+This script will read the list of repositories from the CDK configuration and dispatch the "Deploy to AWS" workflow for each repository.
+
+### 7. HTTP API sample (Lambda JSON, not the dashboard)
 
 After deploy, use stack output **HttpApiUrl** to call the **Lambda-backed JSON API** (e.g. `curl "$HttpApiUrl"`). For the **browser dashboard**, run or deploy **`aws-infra-dashboard`** separately.
 
-### 7. Optional: `projectName`
+### 8. Optional: `projectName`
 
 ```bash
 npx cdk deploy -c projectName=my-sandbox AwsInfra-Network
 ```
 
-### 8. HTTPS (no manual EC2 login)
+### 9. HTTPS (no manual EC2 login)
 
 #### Option A — **Managed HTTPS (recommended): ACM + ALB + Route 53**
 
@@ -208,6 +220,184 @@ Or destroy stacks individually (often **HttpApi** / **Lakehouse-S3** / **Redis**
 
 ---
 
+## Adding a New Application
+
+To add and host a new application behind the nginx host with automated deployment via GitHub Actions, follow these steps:
+
+### 1. Register the application in the CDK configuration
+
+Add a new application definition object to the `EC2_NGINX_APPS` array in [ec2-nginx-apps.ts](file:///Users/ram/Documents/code/github/aws-experimentation/aws-infra/lib/config/ec2-nginx-apps.ts).
+
+Here is a template structure with all supported options:
+
+```typescript
+{
+  // Unique stable identifier (kebab-case). Drives S3 prefixes, CodeDeploy deployment group name suffixes, and CDK output keys.
+  id: 'my-awesome-app',
+
+  // The GitHub repository path (owner/repo). Used for OIDC role access scoping.
+  repoName: 'ran310/my-awesome-app',
+
+  // S3 folder prefix under the artifact bucket where CodeDeploy release bundles are uploaded.
+  s3ArtifactPrefix: 'my-awesome-app',
+
+  // Public URL path prefix. e.g. /my-awesome-app. Must start with '/' and must not end with '/'.
+  // Use "" only if this is the default root site (proxied as location /).
+  pathPrefix: '/my-awesome-app',
+
+  // Local upstream port the application process listens on (must be unique).
+  upstreamPort: 8087,
+
+  // Register a dedicated CodeDeploy deployment group + stack output.
+  codeDeploy: true,
+
+  // (Optional) If set, user-data automatically creates target directory, env file, and systemd unit (first-boot only).
+  userDataBootstrap: {
+    optDir: '/opt/my-awesome-app',
+    systemdServiceName: 'my-awesome-app',
+    systemdDescription: 'My Awesome App (Gunicorn)',
+    conditionPathExists: '/opt/my-awesome-app/venv/bin/gunicorn',
+    workingDirectory: '/opt/my-awesome-app/app',
+    environmentFile: '/etc/my-awesome-app.env',
+    execStart: '/opt/my-awesome-app/venv/bin/gunicorn --bind 127.0.0.1:__PORT__ app:app', // __PORT__ and __PATH_PREFIX__ are auto-substituted
+    extraEnvLines: [ // (Optional) Additional lines appended to the environment file
+      'FLASK_DEBUG=1'
+    ]
+  },
+
+  // (Optional) For inserting custom nginx location blocks before proxy routing
+  // nginxExtraLocations: [ ... ],
+
+  // (Optional) Apply HTTP Basic Auth
+  // nginxBasicAuth: { realm: 'App Realm', userFile: '/etc/nginx/.htpasswd' },
+
+  // (Optional) Run custom shell scripts on the EC2 instance post-deployment setup
+  // userDataExtra: ['mkdir -p /var/lib/my-awesome-app']
+}
+```
+
+### 2. Synthesize and redeploy the infra
+
+Save the configuration and deploy the updated EC2 Nginx and GitHub OIDC stacks:
+
+```bash
+cd aws-infra
+npm run synth
+npx cdk deploy AwsInfra-Ec2Nginx AwsInfra-GitHubOidc
+```
+
+Deploying updates the EC2 instance's Nginx configuration via SSM, provisions the CodeDeploy Deployment Group (`<projectName>-ec2-nginx-dg-my-awesome-app`), and configures the OIDC IAM role trust policy to allow your new GitHub repository to assume it.
+
+### 3. Configure the Application GitHub Repository
+
+To enable automated deployment on push, configure your application repository with the following:
+
+#### A. Set up the OIDC Role Secret
+1. Fetch the value of the `GitHubActionsRoleArn` output from the `AwsInfra-GitHubOidc` stack.
+2. In your application's GitHub repository settings, go to **Settings -> Secrets and variables -> Actions** and create a repository secret named **`AWS_ROLE_TO_ASSUME`** containing that ARN.
+3. *Alternative:* You can automate secret synchronization across your app repos using the helper script:
+   ```bash
+   ./scripts/sync-github-aws-role-secret.sh --from-ec2-nginx-apps
+   ```
+
+#### B. Create `appspec.yml`
+Create an `appspec.yml` file at the root of the application repository to define how CodeDeploy installs and restarts your application:
+
+```yaml
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/my-awesome-app/app
+permissions:
+  - object: /opt/my-awesome-app
+    owner: ec2-user
+    group: ec2-user
+    mode: 755
+    type:
+      - directory
+      - file
+hooks:
+  BeforeInstall:
+    - location: scripts/before-install.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: scripts/after-install.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: scripts/application-start.sh
+      timeout: 120
+      runas: root
+```
+
+*Typical hook script implementations:*
+- **`scripts/before-install.sh`**: Stop the active service to free files (e.g. `systemctl stop my-awesome-app || true`).
+- **`scripts/after-install.sh`**: Set up a virtual environment (e.g., Python venv), run `pip install -r requirements.txt`, create logs folders, and ensure permissions match.
+- **`scripts/application-start.sh`**: Reload systemd configurations and restart the application service:
+  ```bash
+  #!/bin/bash
+  systemctl daemon-reload
+  systemctl restart my-awesome-app
+  ```
+
+#### C. Create a Deployment Workflow
+Create a `.github/workflows/deploy.yml` file in your application repository:
+
+```yaml
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # (Optional) Add build/test steps here, e.g., setting up Node or Python
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1 # Change to match your AWS deployment region
+
+      - name: Deploy to AWS CodeDeploy
+        run: |
+          # Fetch the artifact bucket name dynamically from the SSM parameter
+          PROJECT_NAME="learn-aws" # Must match context/projectName in cdk.json (default: 'learn-aws')
+          
+          BUCKET_NAME=$(aws ssm get-parameter --name "/$PROJECT_NAME/ec2-nginx/artifact-bucket-name" --query "Parameter.Value" --output text)
+          APP_NAME="${PROJECT_NAME}-ec2-nginx-apps"
+          DG_NAME="${PROJECT_NAME}-ec2-nginx-dg-my-awesome-app" # Suffix matches your app.id
+
+          # Package files and upload to S3
+          aws deploy push \
+            --application-name "$APP_NAME" \
+            --s3-location "s3://$BUCKET_NAME/my-awesome-app/releases/bundle.zip" \
+            --source .
+
+          # Create deployment
+          aws deploy create-deployment \
+            --application-name "$APP_NAME" \
+            --deployment-group-name "$DG_NAME" \
+            --s3-location "bucket=$BUCKET_NAME,key=my-awesome-app/releases/bundle.zip,bundleType=zip" \
+            --file-exists-behavior OVERWRITE
+```
+
+---
+
 ## Cost notes
 
 NAT Gateway, ElastiCache, and EC2 are usually **not free tier**. Tear down when idle.
@@ -217,5 +407,5 @@ NAT Gateway, ElastiCache, and EC2 are usually **not free tier**. Tear down when 
 ## Extending
 
 - **New stack:** add under `lib/stacks/` and register in `bin/app.ts`; extend **`bin/generate-infra-artifacts.mjs`** if you want new nodes in `architecture.mmd`.
-- **More nginx apps:** add an entry to **`lib/config/ec2-nginx-apps.ts`** (nginx + S3 + CodeDeploy are generated from that list). User-data still owns `/etc/nginx/conf.d/<projectName>-apps.conf`; app repos must not overwrite nginx.
+- **More nginx apps:** register a new service. See the step-by-step instructions in [Adding a New Application](#adding-a-new-application) above.
 - **Lambda in VPC** talking to Redis (or future RDS): add a security group and allow it on the cache/DB stack (pattern similar to the EC2 SG today).

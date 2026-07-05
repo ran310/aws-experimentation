@@ -14,14 +14,25 @@ const PROXY_COMMON = [
   '        proxy_set_header X-Forwarded-Proto $scheme;',
 ] as const;
 
-function nginxProxyLocation(pathPrefix: string, port: number): string[] {
+function nginxProxyLocation(
+  pathPrefix: string,
+  port: number,
+  basicAuth?: { realm: string; userFile: string },
+): string[] {
   const p = pathPrefix;
+  const authLines = basicAuth
+    ? [
+        `        auth_basic "${basicAuth.realm.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}";`,
+        `        auth_basic_user_file ${basicAuth.userFile};`,
+      ]
+    : [];
   return [
     `    location = ${p} {`,
     `        return 301 ${p}/;`,
     '    }',
     '',
     `    location ${p}/ {`,
+    ...authLines,
     `        proxy_pass http://127.0.0.1:${port}/;`,
     ...PROXY_COMMON,
     `        proxy_set_header X-Forwarded-Prefix ${p};`,
@@ -75,7 +86,7 @@ export function renderNginxServerBlock(apps: Ec2NginxAppDefinition[]): string {
     for (const extra of a.nginxExtraLocations ?? []) {
       lines.push(extra);
     }
-    lines.push(...nginxProxyLocation(a.pathPrefix, a.upstreamPort));
+    lines.push(...nginxProxyLocation(a.pathPrefix, a.upstreamPort, a.nginxBasicAuth));
   }
 
   lines.push(EC2_NGINX_GLOBAL_LOCATION_SNIPPETS);
